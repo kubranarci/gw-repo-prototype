@@ -7,7 +7,6 @@ import os, time
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@db/dbname")
 engine = create_engine(DATABASE_URL, echo=True)
 
-# API Key Authentication
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise EnvironmentError("Missing API_KEY environment variable")
@@ -16,12 +15,12 @@ security = HTTPBearer()
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
     if credentials.credentials != API_KEY:
         raise HTTPException(
-            status_code=401, # Unauthorized
+            status_code=401,
             detail="Invalid API Key"
         )
     return credentials.credentials
 
-# SQLModel Models
+
 class ProcessExecutionParameterInput(SQLModel, table=True):
     process_execution_id: str = Field(foreign_key="processexecution.id", primary_key=True)
     parameter_name: str = Field(primary_key=True)
@@ -32,17 +31,16 @@ class ProcessExecutionParameterInput(SQLModel, table=True):
 class ProcessExecutionInputFile(SQLModel, table=True):
     process_execution_id: str = Field(foreign_key="processexecution.id", primary_key=True)
     filename: str = Field(primary_key=True)
-    xxhash128: str = None
+    xxhash128: Optional[str] = None
 
     process_execution: Optional["ProcessExecution"] = Relationship(back_populates="input_files")
 
 class ProcessExecutionOutputFile(SQLModel, table=True):
     process_execution_id: str = Field(foreign_key="processexecution.id", primary_key=True)
     filename: str = Field(primary_key=True)
-    xxhash128: str = None
+    xxhash128: Optional[str] = None
 
     process_execution: Optional["ProcessExecution"] = Relationship(back_populates="output_files")
-
 
 class WorkflowExecution(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -54,7 +52,6 @@ class WorkflowExecution(SQLModel, table=True):
     revision_id: Optional[str] = None
 
     process_executions: List["ProcessExecution"] = Relationship(back_populates="workflow_execution")
-
 
 class ProcessExecution(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -85,7 +82,6 @@ class ProcessExecution(SQLModel, table=True):
     output_files: List[ProcessExecutionOutputFile] = Relationship(back_populates="process_execution")
 
 
-# App and DB dependency
 app = FastAPI()
 
 def get_session():
@@ -96,7 +92,6 @@ def get_session():
 def on_startup():
     SQLModel.metadata.create_all(engine)
 
-# Routes
 
 @app.post("/workflows/", response_model=WorkflowExecution)
 def create_workflow(
@@ -104,10 +99,14 @@ def create_workflow(
     session: Session = Depends(get_session), 
     api_key: str = Depends(verify_api_key)
 ):
-    session.add(execution)
+    db_obj = session.merge(execution)
     session.commit()
-    session.refresh(execution)
-    return execution
+    session.refresh(db_obj)
+    return db_obj
+
+@app.get("/workflows/", response_model=List[WorkflowExecution])
+def get_workflows(session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
+    return session.exec(select(WorkflowExecution)).all()
 
 @app.get("/workflows/{execution_id}", response_model=WorkflowExecution)
 def get_workflow(execution_id: str, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
@@ -118,10 +117,14 @@ def get_workflow(execution_id: str, session: Session = Depends(get_session), api
 
 @app.post("/processes/", response_model=ProcessExecution)
 def create_process(process: ProcessExecution, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
-    session.add(process)
+    db_obj = session.merge(process)
     session.commit()
-    session.refresh(process)
-    return process
+    session.refresh(db_obj)
+    return db_obj
+
+@app.get("/processes/", response_model=List[ProcessExecution])
+def get_processes(session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
+    return session.exec(select(ProcessExecution)).all()
 
 @app.get("/processes/{process_id}", response_model=ProcessExecution)
 def get_process(process_id: str, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
@@ -141,10 +144,10 @@ def delete_process(process_id: str, session: Session = Depends(get_session), api
 
 @app.post("/parameters/", response_model=ProcessExecutionParameterInput)
 def create_parameter(param: ProcessExecutionParameterInput, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
-    session.add(param)
+    db_obj = session.merge(param)
     session.commit()
-    session.refresh(param)
-    return param
+    session.refresh(db_obj)
+    return db_obj
 
 @app.get("/parameters/{process_id}", response_model=List[ProcessExecutionParameterInput])
 def get_parameters(process_id: str, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
@@ -162,10 +165,10 @@ def delete_parameters(process_id: str, session: Session = Depends(get_session), 
 
 @app.post("/input_files/", response_model=ProcessExecutionInputFile)
 def create_input_file(file: ProcessExecutionInputFile, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
-    session.add(file)
+    db_obj = session.merge(file)
     session.commit()
-    session.refresh(file)
-    return file
+    session.refresh(db_obj)
+    return db_obj
 
 @app.get("/input_files/{process_id}", response_model=List[ProcessExecutionInputFile])
 def get_input_files(process_id: str, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
@@ -182,10 +185,10 @@ def delete_input_files(process_id: str, session: Session = Depends(get_session),
 
 @app.post("/output_files/", response_model=ProcessExecutionOutputFile)
 def create_output_file(file: ProcessExecutionOutputFile, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):
-    session.add(file)
+    db_obj = session.merge(file)
     session.commit()
-    session.refresh(file)
-    return file
+    session.refresh(db_obj)
+    return db_obj
 
 @app.get("/output_files/{process_id}", response_model=List[ProcessExecutionOutputFile])
 def get_output_files(process_id: str, session: Session = Depends(get_session), api_key: str = Depends(verify_api_key)):

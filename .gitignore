@@ -1,0 +1,5 @@
+  # Streamlit agent skills (environment-specific symlinks)
+  .agents/skills/developing-with-streamlit
+  client/.env
+  app/.env
+  db/.env

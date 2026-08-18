@@ -1,12 +1,8 @@
 import typer
 import requests
 import json
-import subprocess
 import re
-#import hashlib
 import os
-import xxhash
-from urllib.parse import urlparse, unquote
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -16,10 +12,10 @@ load_dotenv()
 app = typer.Typer()
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:80")
+INSTITUTE_ID = os.getenv("INSTITUTE_ID", "DKFZ")
 
-# Converts duration as represented in 'nextflow log' output to seconds
 def duration_to_seconds(duration: str) -> float:
-    if duration == "-":
+    if duration == "-" or not duration:
         return 0.0  
     
     pattern = re.compile(r'(?:(\d+\.?\d*)d)?\s*(?:(\d+\.?\d*)h)?\s*(?:(\d+\.?\d*)m)?\s*(?:(\d+\.?\d*)s)?\s*(?:(\d+\.?\d*)ms)?')
@@ -36,232 +32,252 @@ def duration_to_seconds(duration: str) -> float:
 
     return days * 86400 + hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
 
-# Extract Nextflow version from BCO provenance file
-def get_nextflow_version(bco_data: dict):
-    """Get Nextflow version from BCO file"""
-    nextflow_info = next((item for item in bco_data['execution_domain']['software_prerequisites'] if item['name'] == 'Nextflow'), None)
-    nextflow_version = nextflow_info['version'] if nextflow_info else None
-    return nextflow_version
-
-# Get file path of trace file from log file
-def get_trace_filepath(log_file: Path) -> Path | None:
-    pattern = re.compile(r"trace file: (/.+\.txt)")
-    with open(log_file, "r") as f:
-        for line in f:
-            match = pattern.search(line)
-            if match:
-                return Path(match.group(1))
-    return None    
-
-# Extract latest workflow execution info from 'nextflow log'
-def get_nextflow_log(log_file: Path, bco_data: dict):
-    """Get workflow execution details using nextflow log command"""
-    result = subprocess.run(["nextflow", "log"], capture_output=True, text=True)
-    if result.returncode != 0:
-        typer.echo("Error running 'nextflow log'", err=True)
+def parse_memory_value(value):
+    if not value or value == "-":
         return None
-    
-    lines = result.stdout.strip().split("\n")
-    headers = [item.strip() for item in lines[0].split("\t")]
-    latest_run = [item.strip() for item in lines[-1].split("\t")]
+    match = re.match(r'^([\d.]+)\s*([KMGT]B?)?', value.strip(), re.IGNORECASE)
+    if not match:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    num = float(match.group(1))
+    unit = (match.group(2) or "MB").upper()
+    if unit in ("K", "KB"):
+        return num / 1024
+    elif unit in ("M", "MB"):
+        return num
+    elif unit in ("G", "GB"):
+        return num * 1024
+    elif unit in ("T", "TB"):
+        return num * (1024 ** 2)
+    return num
 
-    execution_data = dict(zip(headers, latest_run))
+def parse_trace_time(time_str):
+    if not time_str or time_str == "-":
+        return 0.0
+    try:
+        return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f").timestamp()
+    except ValueError:
+        try:
+            return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            return 0.0
+
+def get_nextflow_version(bco_data: dict):
+    exec_domain = bco_data.get('execution_domain', {})
+    prerequisites = exec_domain.get('software_prerequisites', [])
+    nextflow_info = next((item for item in prerequisites if item.get('name') == 'Nextflow'), None)
+    return nextflow_info['version'] if nextflow_info else "unknown"
+
+def get_workflow_metadata_from_bco(bco_data: dict):
+    session_id = bco_data.get("object_id", "").replace("urn:uuid:", "")
+    prov_domain = bco_data.get("provenance_domain", {})
+    start_time_str = prov_domain.get("created", "")
+    
+    try:
+        start_time = datetime.fromisoformat(start_time_str).timestamp()
+    except ValueError:
+        start_time = 0.0
 
     return {
-        "id": execution_data.get("SESSION ID"),
-        "start_time": datetime.strptime(execution_data["TIMESTAMP"], "%Y-%m-%d %H:%M:%S").timestamp(),
-        "duration": duration_to_seconds(execution_data.get("DURATION")),
-        "run_name": execution_data.get("RUN NAME"),
+        "id": session_id,
+        "start_time": start_time,
+        "duration": 0.0,
+        "run_name": prov_domain.get("name", "unknown_pipeline"),
         "nextflow_version": get_nextflow_version(bco_data),
-        "revision_id": execution_data.get("REVISION ID"),
-        "final_state": execution_data.get("STATUS"),
+        "revision_id": prov_domain.get("version", ""),
+        "final_state": "COMPLETED"
     }
 
-# Extract process execution data from Nextflow trace file
-def get_process_execution_data(trace_file, workflow_id): 
-    """Parse Nextflow trace file and extract process execution data"""
-    import uuid
-    
+def get_process_execution_data(trace_file: Path, workflow_id: str): 
     with open(trace_file, "r") as f:
         lines = f.readlines()
 
-    headers = lines[0].strip().split("\t")
-    data = [dict(zip(headers, line.strip().split("\t"))) for line in lines[1:]]
+    if not lines or len(lines) < 2:
+        return []
+
+    # Başlıkları temizle (Büyük/küçük harf duyarsız hale getiriyoruz)
+    headers = [h.strip().lstrip('#').lower() for h in lines[0].strip().split("\t")]
+    
+    data = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        values = [v.strip() for v in line.split("\t")]
+        # Değerler başlıklardan azsa eksikleri tamamla
+        if len(values) < len(headers):
+            values.extend([''] * (len(headers) - len(values)))
+        
+        row_dict = dict(zip(headers, values))
+        data.append(row_dict)
 
     process_execution_data = []
     for item in data:
+        process_name = item.get("process") or item.get("name", "unknown")
+        original_hash = item.get('hash')
+        
+        unique_process_id = f"{workflow_id}_{original_hash}"
+        
+        def get_val(*keys):
+            for k in keys:
+                val = item.get(k)
+                if val and val != "-" and val != "":
+                    return val
+            return None
+
+        # Gerçek kullanım değerlerini çekme
+        pct_cpu_raw = get_val("%cpu", "pct_cpu")
+        pct_cpu = float(pct_cpu_raw.replace("%", "")) if pct_cpu_raw else 0.0
+
+        pct_mem_raw = get_val("%mem", "pct_mem")
+        pct_mem = float(pct_mem_raw.replace("%", "")) if pct_mem_raw else 0.0
+
+        exit_raw = get_val("exit")
+        exit_code = int(float(exit_raw)) if exit_raw else None
+
         process_execution_data.append({
-            "id": item.get('hash'),  
+            "id": unique_process_id,  
             "workflow_execution_id": workflow_id,  
-            "process_name": item.get("process"),
-            "module_name": item.get("module"),
-            "container_name": item.get("container"),
-            "final_status": item.get("status"),
-            "exit_code": int(item.get("exit")),
-            "start_time": datetime.strptime(item["start"], "%Y-%m-%d %H:%M:%S.%f").timestamp(),  
-            "duration": duration_to_seconds(item.get("duration")),
-            "cpus_requested": int(item.get("cpus")),
-            "time_requested": duration_to_seconds(item.get("time", "0s")),  
-            "storage_requested": parse_memory_value(item.get("disk", "0 MB")),  
-            "memory_requested": parse_memory_value(item.get("memory", "0 MB")),  
-            "realtime": duration_to_seconds(item.get("realtime", "0s")),
-            "queue_name": item.get("queue"),
-            "percent_cpu": float(item.get("%cpu").rstrip("%")),
-            "percent_memory": float(item.get("%mem").rstrip("%")),
-            "peak_rss": parse_memory_value(item.get("peak_rss")),
-            "peak_vmem": parse_memory_value(item.get("peak_vmem")),
-            "read_char": parse_memory_value(item.get("rchar")),
-            "write_char": parse_memory_value(item.get("wchar")),
+            "process_name": process_name,
+            "module_name": get_val("module") or "",
+            "container_name": get_val("container") or "",  # Dosyada yoksa boş kalır
+            "final_status": get_val("status"),
+            "exit_code": exit_code,
+            "start_time": parse_trace_time(get_val("submit", "start")),  
+            "duration": duration_to_seconds(get_val("duration") or "0s"),
+            "cpus_requested": None, # Dosyada yok
+            "time_requested": duration_to_seconds(get_val("time") or "0s"),  
+            "storage_requested": parse_memory_value(get_val("disk")),  
+            "memory_requested": None, # Dosyada yok
+            "realtime": duration_to_seconds(get_val("realtime") or "0s"),
+            "queue_name": get_val("queue") or "",
+            "percent_cpu": pct_cpu,
+            "percent_memory": pct_mem,
+            "peak_rss": parse_memory_value(get_val("peak_rss")),
+            "peak_vmem": parse_memory_value(get_val("peak_vmem")),
+            "read_char": parse_memory_value(get_val("rchar")),
+            "write_char": parse_memory_value(get_val("wchar")),
         })    
     return process_execution_data
 
-def parse_memory_value(value):
-    """Convert memory values to numeric values in MB"""
-    if value == "-" or not value:
-        return None
-    try:
-        num, unit = value.split()
-        num = float(num)
-        unit = unit.upper()
-        conversion_factors = {"KB": 1/1024, "MB": 1, "GB": 1024, "TB": 1024**2}
-        return num * conversion_factors.get(unit, 1)  
-    except Exception:
-        return None
-
-# Convert BCO process id to process id format used in the trace file
 def extract_process_id(name: str) -> str:
     return f"{name[:2]}/{name[2:8]}"
 
-def get_file_xxhash128(filename):
-    with open(filename, 'rb', buffering=0) as f:
-        h = xxhash.xxh128()
-        # Read the file in chunks to avoid memory issues with large files
-        for chunk in iter(lambda: f.read(4096), b""):
-            h.update(chunk)
-        return h.hexdigest()
-
-def get_directory_xxhash128(dirname):
-    files = []
-    for root, _, filenames in os.walk(dirname):
-        for filename in filenames:
-            files.append(os.path.join(root, filename))
-    files.sort()
-    
-    xxhash_values = []
-    for file in files:
-        try:
-            file_hash = xxhash.xxh128()
-            with open(file, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    file_hash.update(chunk)
-            xxhash_values.append(f"{file_hash.hexdigest()} {file}")
-        except Exception as e:
-            print(f"Skipping {file}: {e}")
-    
-    final_hash = xxhash.xxh128()
-    for line in xxhash_values:
-        final_hash.update(line.encode())
-    return final_hash.hexdigest()
-
-def get_obj_xxhash128(obj):
-    parsed_url = urlparse(obj).path
-    full_path = unquote(parsed_url)
-    if os.path.isfile(full_path):
-        return get_file_xxhash128(full_path)
-    elif os.path.isdir(full_path):
-        return get_directory_xxhash128(full_path)
-    else:
-        return None
-
-# Extract provenance from BCO file
-def get_provenance_data(bco_data):
+def get_provenance_data(bco_data, workflow_id: str):
     process_executions_inputs = []
     process_executions_outputs = []
 
     for step in bco_data.get("description_domain", {}).get("pipeline_steps", []):
-        process_id = extract_process_id(step["name"])
+        original_hash = extract_process_id(step["name"])
+        unique_process_id = f"{workflow_id}_{original_hash}"
     
         input_files = list(set([file["uri"] for file in step.get("input_list", [])]))
         output_files = list(set([file["uri"] for file in step.get("output_list", [])]))
     
         for input_file in input_files:
-            if input_file.startswith(('http://', 'https://')):
-                xxhash128 = None
-            else:
-                xxhash128 = get_obj_xxhash128(input_file)  
             process_executions_inputs.append({
-                "process_execution_id": process_id,
+                "process_execution_id": unique_process_id,
                 "filename": input_file,
-                "xxhash128": xxhash128,  
+                "xxhash128": "NOT_AVAILABLE",
             })
+            
         for output_file in output_files:
-            xxhash128 = get_obj_xxhash128(output_file)  
             process_executions_outputs.append({
-                "process_execution_id": process_id,
+                "process_execution_id": unique_process_id,
                 "filename": output_file,
-                "xxhash128": xxhash128, 
+                "xxhash128": "NOT_AVAILABLE",
             })
 
     return (process_executions_inputs, process_executions_outputs)
 
-
+def find_and_group_runs(pipeline_info_dir: Path):
+    runs = {}
+    
+    for trace_file in pipeline_info_dir.glob("execution_trace_*.txt"):
+        match = re.search(r"execution_trace_(.+)\.txt", trace_file.name)
+        if match:
+            runs[match.group(1)] = {"trace": trace_file}
+            
+    for bco_file in pipeline_info_dir.glob("manifest_*.bco.json"):
+        match = re.search(r"manifest_(.+)\.bco\.json", bco_file.name)
+        if match:
+            ts = match.group(1)
+            if ts in runs:
+                runs[ts]["bco"] = bco_file
+                
+    return {ts: files for ts, files in runs.items() if "bco" in files and "trace" in files}
 
 @app.command()
-def submit(log_file: Path, bco_file: Path, api_key: str = typer.Option(None, help="API key for authentication")):
-    """Submit Nextflow workflow and process execution information to GW-RePO API"""
-    with open(bco_file, "r") as f:
-        bco_data = json.load(f)
-
-    # Get API key from environment if not provided
+def submit_directory(
+    pipeline_info_dir: Path = typer.Argument(..., help="Path to the pipeline_info directory containing trace and bco files"),
+    api_key: str = typer.Option(None, help="API key for authentication")
+):
+    
     if api_key is None:
         api_key = os.getenv("API_KEY")
-        if api_key is None:
+        if not api_key:
             typer.echo("API key must be provided either as argument or API_KEY environment variable", err=True)
             return
     
-    # Authentication headers
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
-    # Get workflow execution data and submit to API
-    workflow_execution_data = get_nextflow_log(log_file, bco_data)
-    response = requests.post(f"{API_BASE_URL}/workflows/", json=workflow_execution_data, headers=headers)
-    if response.status_code != 200:
-        typer.echo("Failed to submit workflow execution", err=True)
+    grouped_runs = find_and_group_runs(pipeline_info_dir)
+    
+    if not grouped_runs:
+        typer.echo("No valid execution pairs (trace + bco) found in the specified directory.", err=True)
         return
-    typer.echo("Workflow execution submitted successfully")
 
-    # Get process execution data and submit to API
-    trace_file = get_trace_filepath(log_file)
-    typer.echo (f"Processing trace file: {trace_file}")
-    workflow_id = workflow_execution_data["id"]
-    process_execution_data = get_process_execution_data(trace_file, workflow_id)
-    for entry in process_execution_data:
-        response = requests.post(f"{API_BASE_URL}/processes/", json=entry, headers=headers)
-        if response.status_code != 200:
-            typer.echo(f"Failed to submit process execution: {entry['process_name']}", err=True)
-            return
-        typer.echo(f"Process execution submitted successfully: {entry['process_name']}")
-    typer.echo("All process executions submitted successfully")
+    typer.echo(f"Found {len(grouped_runs)} workflow runs to process. Institute target: {INSTITUTE_ID}")
 
-    # Get provenance data and submit to API
-    typer.echo (f"Processing provenance file: {bco_file}") 
-    (file_inputs, file_outputs) = get_provenance_data(bco_data)
-    for entry in file_inputs:
-        response = requests.post(f"{API_BASE_URL}/input_files/", json=entry, headers=headers)
+    for timestamp, files in grouped_runs.items():
+        trace_file = files["trace"]
+        bco_file = files["bco"]
+        
+        typer.echo(f"\n--- Processing Run: {timestamp} ---")
+        
+        with open(bco_file, "r") as f:
+            bco_data = json.load(f)
+
+        workflow_execution_data = get_workflow_metadata_from_bco(bco_data)
+        
+        response = requests.post(f"{API_BASE_URL}/workflows/", json=workflow_execution_data, headers=headers)
+        
         if response.status_code != 200:
-            typer.echo(f"Failed to submit input files: {entry['filename']}", err=True)
-            return
-        typer.echo(f"Input files submitted successfully: {entry['filename']}")
-    for entry in file_outputs:
-        response = requests.post(f"{API_BASE_URL}/output_files/", json=entry, headers=headers)
-        if response.status_code != 200:
-            typer.echo(f"Failed to submit output files: {entry['filename']}", err=True)
-            return
-        typer.echo(f"Output files submitted successfully: {entry['filename']}")
-    typer.echo("All input and output files submitted successfully")
+            typer.echo(f"Failed to submit workflow execution: {response.text}", err=True)
+            continue
+            
+        typer.echo("Workflow execution submitted successfully")
+
+        workflow_id = workflow_execution_data["id"]
+        process_execution_data = get_process_execution_data(trace_file, workflow_id)
+        
+        for entry in process_execution_data:
+            response = requests.post(f"{API_BASE_URL}/processes/", json=entry, headers=headers)
+            if response.status_code != 200:
+                typer.echo(f"Failed to submit process execution: {entry['process_name']} - {response.text}", err=True)
+                break
+        else:
+            typer.echo("All process executions submitted successfully")
+
+        (file_inputs, file_outputs) = get_provenance_data(bco_data, workflow_id)
+        
+        for entry in file_inputs:
+            response = requests.post(f"{API_BASE_URL}/input_files/", json=entry, headers=headers)
+            if response.status_code != 200:
+                typer.echo(f"Failed to submit input file: {entry['filename']} - API Response: {response.text}", err=True)
+                break
+                
+        for entry in file_outputs:
+            response = requests.post(f"{API_BASE_URL}/output_files/", json=entry, headers=headers)
+            if response.status_code != 200:
+                typer.echo(f"Failed to submit output file: {entry['filename']} - API Response: {response.text}", err=True)
+                break
+        else:
+            typer.echo("All input and output files submitted successfully")
 
 if __name__ == "__main__":
     app()

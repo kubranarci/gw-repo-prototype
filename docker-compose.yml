@@ -14,6 +14,7 @@ services:
       - gw-repo-network
     ports:
       - "80:80"
+
   db:
     image: postgres
     restart: always
@@ -33,6 +34,21 @@ services:
     networks:
       - gw-repo-network
 
+  streamlit:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    restart: always
+    ports:
+      - "8501:8501"
+    env_file:
+      - ./api/.env
+    environment:
+      - API_BASE_URL=http://api
+    depends_on:
+      - api
+    networks:
+      - gw-repo-network
+
 networks:
   gw-repo-network:
-

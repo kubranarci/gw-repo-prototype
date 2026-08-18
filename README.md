@@ -1,13 +1,13 @@
 # gw-repo-prototype
-An API prototype for storing provenance and resource usage information from Nextflow workflow executions
+An API prototype for storing provenance and resource usage information from Nextflow workflow executions, equipped with a Streamlit analytics dashboard.
 
-# API deployment (not needed if some deployment of the API is already available to you)
+## API Deployment
 
-Add a `.env` files to `api/` with these variable definitions:
+Add a `.env` file to `api/` with these variable definitions:
 
 ```bash
 API_KEY='add-the-desired-api-key-here'
-DATABASE_URL='postgresql://postgres:postgres-password@hostname/database-name'
+DATABASE_URL='postgresql://postgres:postgres-password@db/database-name'
 ```
 
 Add a `.env` file to `db/` (directory needs to be created):
@@ -17,25 +17,23 @@ POSTGRES_PASSWORD=postgres-password
 POSTGRES_DB=database-name
 ```
 
-Start the containers:
+Start the core backend containers:
 
 ```bash
 docker compose up -d --build
 ```
 
-# Client usage
+## Client Requirements & Setup
 
-## Requirements
-
-Install the requirements:
+Install the updated Python dependencies required for data extraction and visualization:
 
 ```bash
-pip install typer requests xxhash python-dotenv
+pip install typer requests python-dotenv streamlit plotly pandas
 ```
 
-## Nextflow configuration
+### Nextflow Configuration
 
-One needs to enable process trace and the nf-prov plugin with BCO output in `nextflow.config`:
+You must enable process trace and the nf-prov plugin with BCO output in your `nextflow.config`:
 ```groovy
 plugins {
     id 'nf-prov'
@@ -56,29 +54,36 @@ trace {
 }
 ```
 
-After that you can run your workflows as usual.
+Run your SLURM or local workflows as usual. Ensure the pipeline metadata (trace and bco files) is generated in the target execution directory.
 
-## Client configuration
+### Client Environment Configuration
 
-Create a `.env` file in the `client/` directory with the following variables:
+Create a `.env` file in the root or `client/` directory with the following variables:
 
 ```bash
 API_BASE_URL=http://localhost:80
 API_KEY=your_api_key_here
 ```
 
-Alternatively, you can set these as environment variables or provide the API key as a command line argument.
+## Submitting Execution Data
 
-## Client usage
+The client script has been refactored to process entire output directories containing paired execution trace and BCO files. 
 
-`client.py` can be used for extracting the execution metrics and provenance information and sending them to the API:
+Run the client to parse the metadata and submit it to the PostgreSQL database via the REST API:
 
-```
-python client.py submit <log_file> <bco_file> [--api-key <your_api_key>]
+```bash
+python client/client.py <path_to_pipeline_info_directory> [--api-key <your_api_key>]
 ```
 
 Parameters:
+* `<path_to_pipeline_info_directory>`: Path to the directory containing both `.nextflow.log` / `execution_trace_*.txt` and `manifest_*.bco.json` files.
+* `--api-key`: API key for authentication (optional if already exported in your environment).
 
-- `log_file`: Path to the Nextflow log file (`.nextflow.log`)
-- `bco_file`: Path to the BCO provenance file (`bco-*.json`)
-- `--api-key`: API key for authentication (optional if set in environment)
+## Visualization Dashboard
+
+To inspect the resource allocations, I/O bottlenecks, and completion times of your workflows, launch the Streamlit analytics interface:
+
+```bash
+streamlit run ui/app.py
+```
+*(If running on a remote cluster, establish an SSH tunnel for port 8501 or bind Streamlit to `0.0.0.0` to access the dashboard from your local browser).*
