@@ -13,6 +13,25 @@ The `setup.sh` script will:
 - Create the consolidated `.env` configuration file
 - Initialize the database schema
 
+## Data Persistence
+
+**Data is stored permanently** in a PostgreSQL volume and persists across:
+- `docker compose down` / `docker compose up -d`
+- Container restarts
+- System reboots
+
+**To delete all data:**
+```bash
+docker compose down -v  # Removes the database volume
+rm .env                 # Optional: remove configuration
+```
+
+**To view stored data:**
+```bash
+docker compose exec db psql -U postgres -d gw_repo -c "\dt"  # List tables
+docker compose exec db psql -U postgres -d gw_repo -c "SELECT COUNT(*) FROM workflowexecution;"  # Count workflows
+```
+
 ## Client Requirements & Setup
 
 Install Python dependencies:

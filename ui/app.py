@@ -233,6 +233,27 @@ def render_ml_training():
         else:
             st.info("No training results yet. Click 'Start Training' to train models.")
 
+@st.cache_data(ttl=300)
+def fetch_processes(api_key_val, institute_id=None):
+    """Fetch available module names from the API (without instance suffix)."""
+    headers = {
+        "Authorization": f"Bearer {api_key_val}",
+        "Content-Type": "application/json"
+    }
+    try:
+        url = f"{API_BASE_URL}/ml/processes"
+        if institute_id:
+            url += f"?institute_id={institute_id}"
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('processes', [])
+        else:
+            return []
+    except Exception:
+        return []
+
+
 def render_ml_predictions():
     st.title("ML Resource Predictions")
     st.write("Get ML-based predictions for resource requirements of Nextflow processes.")
@@ -241,15 +262,33 @@ def render_ml_predictions():
         st.warning("Please enter your API key in the sidebar to authenticate.")
         return
     
+    # Fetch available processes
+    processes = fetch_processes(API_KEY)
+    
     col1, col2 = st.columns([1, 2])
     
     with col1:
         st.subheader("Prediction Request")
-        process_name = st.text_input("Process Name", placeholder="e.g., BCFTOOLS_SORT")
+        
+        # Cache clear button
+        if st.button("Refresh Module List", key="refresh_processes"):
+            fetch_processes.clear()
+            st.rerun()
+        
+        if processes:
+            # Create a searchable selectbox
+            process_name = st.selectbox(
+                "Select Module",
+                options=processes,
+                placeholder="Choose a module...",
+                help="Select from modules with historical execution data"
+            )
+        else:
+            process_name = st.text_input("Process Name", placeholder="e.g., BCFTOOLS_SORT")
         
         if st.button("Get Prediction", type="primary", use_container_width=True):
             if not process_name:
-                st.error("Please enter a process name")
+                st.error("Please select or enter a process name")
             else:
                 with st.spinner("Getting predictions..."):
                     headers = {
@@ -265,7 +304,10 @@ def render_ml_predictions():
                         if response.status_code == 200:
                             result = response.json()
                             st.session_state['prediction_result'] = result
-                            st.success("Predictions retrieved successfully!")
+                            if result.get('success'):
+                                st.success(f"Predictions for {result.get('module_name', 'module')}")
+                            else:
+                                st.error(result.get('message', 'Prediction failed'))
                         else:
                             st.error(f"Prediction failed: {response.text}")
                     except Exception as e:
@@ -277,7 +319,7 @@ def render_ml_predictions():
             result = st.session_state['prediction_result']
             
             if result.get('success'):
-                st.metric("Process", result.get('process_name', 'N/A'))
+                st.metric("Module", result.get('module_name', 'N/A'))
                 
                 predictions = result.get('predictions', {})
                 
@@ -303,14 +345,15 @@ def render_ml_predictions():
                     cpu_pred = predictions.get('cpu', {})
                     st.metric(
                         "CPU",
-                        f"{cpu_pred.get('value', 0):.1f} {cpu_pred.get('unit', 'cores')}",
+                        f"{int(cpu_pred.get('value', 1))} {cpu_pred.get('unit', 'cores')}",
                         delta=f"P95 margin: {cpu_pred.get('safety_margin', 1)}x"
                     )
                 
                 st.subheader("Nextflow Config")
                 nextflow_config = result.get('nextflow_config', {})
+                module_name = result.get('module_name', 'module')
                 config_text = f"""process {{
-    withName: '{result.get('process_name', '')}' {{
+    withName: '{module_name}' {{
         cpus = {nextflow_config.get('cpus', 1)}
         memory = '{nextflow_config.get('memory', '100 MB')}'
         time = '{nextflow_config.get('time', '1h')}'
@@ -321,7 +364,7 @@ def render_ml_predictions():
                 st.download_button(
                     label="Download Config Snippet",
                     data=config_text,
-                    file_name=f"{result.get('process_name', 'process')}.config",
+                    file_name=f"{module_name}.config",
                     mime="text/plain"
                 )
                 
@@ -331,6 +374,26 @@ def render_ml_predictions():
         else:
             st.info("No predictions yet. Enter a process name and click 'Get Prediction'.")
 
+@st.cache_data
+def fetch_all_optimizations(api_key_val, institute_id=None):
+    """Fetch all optimization recommendations from the API."""
+    headers = {
+        "Authorization": f"Bearer {api_key_val}",
+        "Content-Type": "application/json"
+    }
+    try:
+        url = f"{API_BASE_URL}/ml/optimizations"
+        if institute_id:
+            url += f"?institute_id={institute_id}"
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+    except Exception:
+        return None
+
+
 def render_optimization():
     st.title("Process Optimization Recommendations")
     st.write("Get data-driven optimization recommendations for Nextflow processes based on historical execution data.")
@@ -339,16 +402,76 @@ def render_optimization():
         st.warning("Please enter your API key in the sidebar to authenticate.")
         return
     
+    # Fetch available processes
+    processes = fetch_processes(API_KEY)
+    
     col1, col2 = st.columns([1, 2])
     
     with col1:
         st.subheader("Optimization Request")
-        process_name = st.text_input("Process Name", placeholder="e.g., BCFTOOLS_SORT")
+        
+        # Cache clear button
+        if st.button("Refresh Module List", key="refresh_opt_processes"):
+            fetch_processes.clear()
+            st.rerun()
+        
+        # Download all optimizations button
+        if st.button("Download All Optimizations", use_container_width=True):
+            with st.spinner("Fetching all optimizations..."):
+                all_opts = fetch_all_optimizations(API_KEY)
+                if all_opts and all_opts.get('success'):
+                    # Generate config file content
+                    config_lines = ["// Auto-generated Nextflow configuration", "// Generated by GW-Repo ML Optimization", "process {"]
+                    for opt in all_opts.get('optimizations', []):
+                        module = opt.get('module_name', 'unknown')
+                        rec = opt.get('recommended_config', {})
+                        config_lines.append(f"    withName: '{module}' {{")
+                        config_lines.append(f"        memory = '{rec.get('memory', '1 GB')}'")
+                        config_lines.append(f"        time = '{rec.get('time', '1h')}'")
+                        config_lines.append(f"        cpus = {rec.get('cpus', 1)}")
+                        config_lines.append("    }")
+                    config_lines.append("}")
+                    
+                    config_content = "\n".join(config_lines)
+                    st.download_button(
+                        label="Download nextflow_optimized.config",
+                        data=config_content,
+                        file_name="nextflow_optimized.config",
+                        mime="text/plain",
+                        key="download_all_config"
+                    )
+                    
+                    # Also show as JSON
+                    json_content = json.dumps(all_opts.get('optimizations', []), indent=2)
+                    st.download_button(
+                        label="Download optimizations.json",
+                        data=json_content,
+                        file_name="optimizations.json",
+                        mime="application/json",
+                        key="download_all_json"
+                    )
+                    
+                    st.success(f"Fetched optimizations for {all_opts.get('modules', 0)} modules")
+                else:
+                    st.error("Failed to fetch optimizations")
+        
+        st.divider()
+        
+        if processes:
+            process_name = st.selectbox(
+                "Select Module",
+                options=processes,
+                placeholder="Choose a module...",
+                help="Select from modules with historical execution data"
+            )
+        else:
+            process_name = st.text_input("Process Name", placeholder="e.g., BCFTOOLS_SORT")
+        
         institute_id = st.text_input("Institute ID (optional)", value="DKFZ")
         
         if st.button("Get Recommendations", type="primary", use_container_width=True):
             if not process_name:
-                st.error("Please enter a process name")
+                st.error("Please select or enter a module name")
             else:
                 with st.spinner("Analyzing historical data..."):
                     headers = {
@@ -364,7 +487,10 @@ def render_optimization():
                         if response.status_code == 200:
                             result = response.json()
                             st.session_state['optimization_result'] = result
-                            st.success("Recommendations generated!")
+                            if result.get('success'):
+                                st.success(f"Recommendations for {result.get('module_name', result.get('process_name', 'module'))}")
+                            else:
+                                st.error(result.get('message', 'Optimization failed'))
                         else:
                             st.error(f"Optimization failed: {response.text}")
                     except Exception as e:
@@ -376,7 +502,7 @@ def render_optimization():
             result = st.session_state['optimization_result']
             
             if result.get('success'):
-                st.metric("Process", result.get('process_name', 'N/A'))
+                st.metric("Module", result.get('module_name', result.get('process_name', 'N/A')))
                 st.metric("Historical Samples", result.get('historical_samples', 0))
                 
                 st.subheader("Resource Statistics")
@@ -414,12 +540,30 @@ def render_optimization():
                 
                 st.subheader("Recommended Configuration")
                 rec_config = result.get('recommended_config', {})
+                module_name = result.get('module_name', result.get('process_name', ''))
                 st.code(f"""process {{
-    withName: '{result.get('process_name', '')}' {{
+    withName: '{module_name}' {{
         memory = '{rec_config.get('memory', '1 GB')}'
         time = '{rec_config.get('time', '1h')}'
+        cpus = {rec_config.get('cpus', 1)}
     }}
 }}""", language="groovy")
+                
+                # Download single module config
+                single_config = f"""process {{
+    withName: '{module_name}' {{
+        memory = '{rec_config.get('memory', '1 GB')}'
+        time = '{rec_config.get('time', '1h')}'
+        cpus = {rec_config.get('cpus', 1)}
+    }}
+}}"""
+                st.download_button(
+                    label=f"Download {module_name}.config",
+                    data=single_config,
+                    file_name=f"{module_name}.config",
+                    mime="text/plain",
+                    key=f"download_{module_name}"
+                )
                 
                 if result.get('insights'):
                     st.subheader("Insights")

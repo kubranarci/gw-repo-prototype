@@ -590,23 +590,129 @@ def train_ml_models(
         }
 
 
+def extract_module_name(process_name: str) -> str:
+    """
+    Extract clean module name from process name.
+    
+    Examples:
+        NFCORE:...:TABIX_BGZIPTABIX_GT (test12) -> TABIX_BGZIPTABIX_GT
+        NFCORE:...:BCFTOOLS_FILTER_QUERY_FP (test1) -> BCFTOOLS_FILTER_QUERY_FP
+        NFCORE:...:BCFTOOLS_NORM (test1) -> BCFTOOLS_NORM
+    """
+    # Remove the (instance) part
+    base = process_name.split(' (')[0] if ' (' in process_name else process_name
+    # Get the module name (last part after colon)
+    if ':' in base:
+        module = base.split(':')[-1]
+    else:
+        module = base
+    
+    # Only remove numeric instance suffixes like _1, _2
+    # Keep descriptive suffixes like _FILTER, _QUERY, _FP, _TP, etc.
+    if module.endswith('_1') or module.endswith('_2'):
+        module = module[:-2]
+    
+    return module
+
+
+def format_memory(mb_value: float) -> str:
+    """
+    Format memory to human-readable values.
+    Uses MB for values < 1024, GB for larger values.
+    """
+    if mb_value <= 0:
+        return "256 MB"
+    elif mb_value <= 256:
+        return "256 MB"
+    elif mb_value <= 512:
+        return "512 MB"
+    elif mb_value < 1024:
+        return "768 MB"
+    elif mb_value < 2048:
+        return "1 GB"
+    elif mb_value < 4096:
+        return "2 GB"
+    elif mb_value < 8192:
+        return "4 GB"
+    elif mb_value < 16384:
+        return "8 GB"
+    elif mb_value < 32768:
+        return "16 GB"
+    else:
+        # For very large values, round to nearest 16 GB
+        gb_value = int(round(mb_value / 1024 / 16) * 16)
+        return f"{gb_value} GB"
+
+
+def round_time(seconds: float) -> str:
+    """Round time to practical values with minimum 30 seconds."""
+    if seconds <= 0:
+        return "30s"
+    # Apply 4x safety margin
+    safe_seconds = seconds * 4
+    if safe_seconds < 30:
+        return "30s"
+    elif safe_seconds < 60:
+        return "1m"
+    elif safe_seconds < 300:
+        return f"{int(safe_seconds / 60) * 60}s"  # Round to nearest minute
+    else:
+        minutes = int(safe_seconds / 60)
+        if minutes < 60:
+            return f"{minutes}m"
+        else:
+            hours = int(minutes / 60)
+            return f"{hours}h{minutes % 60}m" if minutes % 60 > 0 else f"{hours}h"
+
+
+@app.get("/ml/processes")
+def list_processes(
+    institute_id: Optional[str] = None,
+    session: Session = Depends(get_session),
+    api_key: str = Depends(verify_api_key)
+):
+    """Get list of distinct module names for dropdown (without instance suffix)."""
+    try:
+        query = "SELECT DISTINCT process_name FROM processexecution"
+        params = {}
+        
+        if institute_id:
+            query += " WHERE institute_id = :institute_id"
+            params['institute_id'] = institute_id
+        
+        query += " ORDER BY process_name"
+        
+        result = session.execute(text(query), params)
+        # Extract unique module names (without instance suffix)
+        all_processes = [row[0] for row in result]
+        module_names = sorted(set(extract_module_name(p) for p in all_processes))
+        
+        return {
+            "success": True,
+            "processes": module_names,
+            "count": len(module_names)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "processes": []
+        }
+
+
 @app.get("/ml/predict")
 def predict_resources(
     process_name: str,
     institute_id: Optional[str] = None,
-    input_size_mb: Optional[float] = None,
-    cpus_requested: Optional[float] = None,
     session: Session = Depends(get_session),
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Get ML-based resource predictions for a process.
+    Get ML-based resource predictions for a process using historical data.
     
     Args:
         process_name: Name of the process (e.g., "BCFTOOLS_SORT")
-        institute_id: Optional institute ID
-        input_size_mb: Optional input data size in MB
-        cpus_requested: Optional requested CPUs
+        institute_id: Optional institute ID to filter historical data
     """
     try:
         try:
@@ -630,18 +736,88 @@ def predict_resources(
                 "message": "Train models first using POST /ml/train"
             }
         
-        # Build feature vector
+        # Get historical data for this module (extract base module name, ignore instance suffix)
+        # Match processes where the module name matches (before the parentheses)
+        query = """
+        SELECT 
+            AVG(p.cpus_requested) as cpus_requested,
+            AVG(p.time_requested) as time_requested,
+            AVG(p.memory_requested) as memory_requested,
+            AVG(p.realtime) as realtime,
+            AVG(p.percent_cpu) as percent_cpu,
+            AVG(p.percent_memory) as percent_memory,
+            AVG(p.peak_rss) as peak_rss,
+            AVG(p.peak_vmem) as peak_vmem,
+            AVG(p.read_char) as read_char,
+            AVG(p.write_char) as write_char,
+            AVG(p.duration) as duration,
+            AVG(p.memory_requested) as memory_requested_mb,
+            AVG(c.energy_consumption_mwh) as energy_consumption_mwh,
+            AVG(c.co2e_mg) as co2e_mg,
+            AVG(c.powerdraw_cpu_w) as powerdraw_cpu_w,
+            MAX(p.institute_id) as institute_id,
+            MAX(p.process_name) as process_name_full,
+            COUNT(*) as sample_count
+        FROM processexecution p
+        LEFT JOIN co2footprint c ON p.id = c.process_execution_id
+        WHERE UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
+           OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name)
+        """
+        params = {"process_name": f"%{process_name}%"}
+        
+        if institute_id:
+            query += " AND p.institute_id = :institute_id"
+            params["institute_id"] = institute_id
+        
+        result = session.execute(text(query), params)
+        row = result.first()
+        
+        if not row or row.sample_count == 0:
+            return {
+                "success": False,
+                "error": "No historical data found for this process",
+                "message": "Submit more workflow data or try a different process name"
+            }
+        
+        # Build feature vector from historical averages
         features = {
-            'process_base': process_name.split('_')[-1] if '_' in process_name else process_name,
+            'cpus_requested': row.cpus_requested or 0,
+            'time_requested': row.time_requested or 0,
+            'storage_requested': 0,
+            'memory_requested': row.memory_requested or 0,
+            'realtime': row.realtime or 0,
+            'percent_cpu': row.percent_cpu or 0,
+            'percent_memory': row.percent_memory or 0,
+            'peak_rss': row.peak_rss or 0,
+            'peak_vmem': row.peak_vmem or 0,
+            'read_char': row.read_char or 0,
+            'write_char': row.write_char or 0,
+            'duration': row.duration or 0,
+            'energy_consumption_mwh': row.energy_consumption_mwh or 0,
+            'co2e_mg': row.co2e_mg or 0,
+            'powerdraw_cpu_w': row.powerdraw_cpu_w or 0,
             'has_module': 1 if ':' in process_name else 0,
-            'cpu_utilization': 0.5,  # Default
-            'memory_utilization': 0.5,  # Default
-            'io_total': input_size_mb * 1024 * 1024 if input_size_mb else 0,
-            'io_ratio': 1.0,
-            'cpu_mem_product': 0,
+            'cpu_utilization': (row.percent_cpu or 0) / 100.0,
+            'memory_utilization': (row.percent_memory or 0) / 100.0,
+            'memory_requested_mb': row.memory_requested or 0,
+            'memory_efficiency': (row.peak_rss or 0) / max(row.memory_requested or 1, 1),
+            'time_efficiency': (row.realtime or 0) / max(row.duration or 1, 1),
+            'io_total': (row.read_char or 0) + (row.write_char or 0),
+            'io_ratio': (row.read_char or 0) / max((row.write_char or 1), 1),
+            'cpu_mem_product': (row.percent_cpu or 0) * (row.peak_rss or 0),
+            'energy_per_sec': (row.energy_consumption_mwh or 0) / max(row.duration or 1, 1),
+            'co2_per_mb': (row.co2e_mg or 0) / max(row.peak_rss or 1, 1),
+            'process_base': row.process_name_full.split('_')[-1].split()[0] if '_' in (row.process_name_full or '') else (row.process_name_full or process_name).split()[0],
             'institute_encoded': 0,
             'cpu_encoded': 0,
         }
+        
+        # Encode institute
+        institute_map = {'UNKNOWN': 0, 'LOCAL': 1, 'NONE': 2, 'DKFZ': 3, 'EMBL': 4}
+        features['institute_encoded'] = institute_map.get(row.institute_id or 'UNKNOWN', 0)
+        
+        # Use clean module name for response
+        module_name = extract_module_name(row.process_name_full or process_name)
         
         # Get predictions for all resource types
         predictions = {}
@@ -656,24 +832,42 @@ def predict_resources(
                     'safety_margin': result['safety_margin'],
                 }
         
-        # Generate Nextflow config recommendation
+        # Calculate CPU from historical data
+        # Use actual average when available, only cap at reasonable maximum (16 CPUs)
+        avg_cpus_requested = row.cpus_requested
+        avg_percent_cpu = row.percent_cpu or 0
+        
+        if avg_cpus_requested and avg_cpus_requested > 0:
+            # Use historical average, cap at 16 for very parallel tools
+            recommended_cpus = min(16, max(1, int(round(avg_cpus_requested))))
+        elif avg_percent_cpu > 0:
+            # Estimate from percent_cpu (e.g., 800% = ~8 cores utilized)
+            # Cap at 16 for highly parallel tools
+            estimated_cpus = int(round(avg_percent_cpu / 100))
+            recommended_cpus = min(16, max(1, estimated_cpus))
+        else:
+            recommended_cpus = 1
+        
+        # Generate Nextflow config recommendation with safe values
         config_recommendation = {}
         if 'memory' in predictions:
-            config_recommendation['memory'] = f"{int(predictions['memory']['value'])} MB"
+            config_recommendation['memory'] = format_memory(predictions['memory']['value'] * 1.5)
         if 'time' in predictions:
-            config_recommendation['time'] = f"{int(predictions['time']['value'])}s"
-        if 'cpu' in predictions:
-            config_recommendation['cpus'] = int(predictions['cpu']['value'])
+            config_recommendation['time'] = round_time(predictions['time']['value'])
+        config_recommendation['cpus'] = recommended_cpus
         
         return {
             "success": True,
-            "process_name": process_name,
+            "module_name": module_name,
+            "historical_samples": int(row.sample_count),
             "predictions": predictions,
             "nextflow_config": config_recommendation,
-            "message": "Predictions include P95 safety margin for production use"
+            "message": "Predictions based on historical data with P95 safety margin"
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e),
@@ -689,19 +883,21 @@ def get_optimization_recommendations(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Get optimization recommendations for a specific process.
+    Get optimization recommendations for a specific module.
     Combines ML predictions with historical data analysis.
     """
     try:
-        # Get historical data for this process
+        # Get historical data for this module (match module name, ignore instance suffix)
         query_str = """
         SELECT 
             p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
             p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
-            c.energy_consumption_mwh, c.co2e_mg
+            c.energy_consumption_mwh, c.co2e_mg,
+            p.process_name
         FROM processexecution p
         LEFT JOIN co2footprint c ON p.id = c.process_execution_id
-        WHERE UPPER(p.process_name) LIKE UPPER(:process_name)
+        WHERE UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
+           OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name)
         """
         
         if institute_id:
@@ -717,7 +913,7 @@ def get_optimization_recommendations(
         if not historical_data:
             return {
                 "success": False,
-                "message": f"No historical data found for process: {process_name}",
+                "message": f"No historical data found for module: {process_name}",
                 "recommendation": "Submit more workflow data first"
             }
         
@@ -739,22 +935,44 @@ def get_optimization_recommendations(
                 'count': len(values)
             }
         
+        # Get clean module name
+        module_name = extract_module_name(process_name)
+        
+        # Calculate stats first
+        mem_stats = calc_stats([r['peak_rss'] for r in historical_data])
+        dur_stats = calc_stats([r['duration'] for r in historical_data])
+        
+        # Calculate average CPUs from historical data
+        # If cpus_requested is missing, estimate from percent_cpu but cap reasonably
+        avg_cpus = []
+        for r in historical_data:
+            if r.get('cpus_requested'):
+                avg_cpus.append(r['cpus_requested'])
+            elif r.get('percent_cpu'):
+                # Estimate from percent_cpu but cap at 4 (most tools are single-threaded or lightly parallel)
+                estimated = min(4, max(1, int(r['percent_cpu'] / 100)))
+                avg_cpus.append(estimated)
+        
+        # Use average, capped at 8 CPUs maximum for safety
+        if avg_cpus:
+            recommended_cpus = min(8, max(1, int(round(np.mean(avg_cpus)))))
+        else:
+            recommended_cpus = 1
+        
         recommendations = {
-            "process_name": process_name,
+            "module_name": module_name,
             "historical_samples": len(historical_data),
-            "memory": calc_stats([r['peak_rss'] for r in historical_data]),
-            "duration": calc_stats([r['duration'] for r in historical_data]),
+            "memory": mem_stats,
+            "duration": dur_stats,
             "cpu_utilization": calc_stats([r['percent_cpu'] for r in historical_data]),
             "energy": calc_stats([r['energy_consumption_mwh'] for r in historical_data if r.get('energy_consumption_mwh')]),
             "co2": calc_stats([r['co2e_mg'] for r in historical_data if r.get('co2e_mg')]),
-            "recommended_config": {}
+            "recommended_config": {
+                "memory": format_memory(mem_stats['p95']) if mem_stats else "256 MB",
+                "time": round_time(dur_stats['p95']) if dur_stats else "1m",
+                "cpus": recommended_cpus
+            }
         }
-        
-        # Generate Nextflow config recommendation
-        if recommendations['memory']:
-            recommendations['recommended_config']['memory'] = f"{int(recommendations['memory']['p95'])} MB"
-        if recommendations['duration']:
-            recommendations['recommended_config']['time'] = f"{int(recommendations['duration']['p95'])}s"
         
         # Add efficiency insights
         insights = []
@@ -780,8 +998,137 @@ def get_optimization_recommendations(
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e),
             "message": "Failed to generate recommendations"
+        }
+
+
+@app.get("/ml/optimizations")
+def get_all_optimizations(
+    institute_id: Optional[str] = None,
+    session: Session = Depends(get_session),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Get optimization recommendations for all modules at once.
+    Returns a downloadable list of all process optimizations.
+    """
+    try:
+        # Get all distinct module names
+        query_modules = "SELECT DISTINCT process_name FROM processexecution"
+        params = {}
+        
+        if institute_id:
+            query_modules += " WHERE institute_id = :institute_id"
+            params['institute_id'] = institute_id
+        
+        result = session.execute(text(query_modules), params)
+        all_processes = [row[0] for row in result]
+        module_names = sorted(set(extract_module_name(p) for p in all_processes))
+        
+        all_optimizations = []
+        
+        for module_name in module_names:
+            # Get historical data for this module
+            query_str = """
+            SELECT 
+                p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
+                p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
+                c.energy_consumption_mwh, c.co2e_mg,
+                COUNT(*) as sample_count
+            FROM processexecution p
+            LEFT JOIN co2footprint c ON p.id = c.process_execution_id
+            WHERE UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
+               OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name)
+            GROUP BY p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
+                     p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
+                     c.energy_consumption_mwh, c.co2e_mg
+            """
+            
+            opt_params = {"process_name": f"%{module_name}%"}
+            if institute_id:
+                query_str += " AND p.institute_id = :institute_id"
+                opt_params["institute_id"] = institute_id
+            
+            result = session.execute(text(query_str), opt_params)
+            historical_data = [dict(row._mapping) for row in result]
+            
+            if not historical_data:
+                continue
+            
+            import numpy as np
+            
+            def calc_stats(values):
+                values = [v for v in values if v is not None and v > 0]
+                if not values:
+                    return None
+                return {
+                    'mean': float(np.mean(values)),
+                    'median': float(np.median(values)),
+                    'p95': float(np.percentile(values, 95)),
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'count': len(values)
+                }
+            
+            mem_stats = calc_stats([r['peak_rss'] for r in historical_data])
+            dur_stats = calc_stats([r['duration'] for r in historical_data])
+            
+            # Calculate average CPUs from historical data
+            # Use actual values when available, cap at 16 for highly parallel tools
+            avg_cpus = []
+            for r in historical_data:
+                if r.get('cpus_requested'):
+                    avg_cpus.append(r['cpus_requested'])
+                elif r.get('percent_cpu'):
+                    # Estimate from percent_cpu (e.g., 800% = ~8 cores)
+                    estimated = min(16, max(1, int(r['percent_cpu'] / 100)))
+                    avg_cpus.append(estimated)
+            
+            # Use average, capped at 16 CPUs for highly parallel tools
+            if avg_cpus:
+                recommended_cpus = min(16, max(1, int(round(np.mean(avg_cpus)))))
+            else:
+                recommended_cpus = 1
+            
+            optimization = {
+                "module_name": module_name,
+                "historical_samples": len(historical_data),
+                "memory": mem_stats,
+                "duration": dur_stats,
+                "cpu_utilization": calc_stats([r['percent_cpu'] for r in historical_data]),
+                "recommended_config": {
+                    "memory": format_memory(mem_stats['p95']) if mem_stats else "256 MB",
+                    "time": round_time(dur_stats['p95']) if dur_stats else "1m",
+                    "cpus": recommended_cpus
+                }
+            }
+            
+            # Add insights
+            insights = []
+            if optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] < 50:
+                insights.append("Low CPU utilization - consider reducing CPU allocation")
+            elif optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] > 90:
+                insights.append("High CPU utilization - process is CPU-bound")
+            
+            optimization['insights'] = insights
+            all_optimizations.append(optimization)
+        
+        return {
+            "success": True,
+            "modules": len(all_optimizations),
+            "optimizations": all_optimizations
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "optimizations": []
         }
