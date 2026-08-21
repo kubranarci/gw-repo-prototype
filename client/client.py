@@ -349,20 +349,28 @@ def get_process_execution_data(trace_file: Path, workflow_id: str):
         exit_raw = get_val("exit")
         exit_code = int(float(exit_raw)) if exit_raw else None
 
+        # Parse cpus_requested (handle both formats: "2" or "2.0")
+        cpus_raw = get_val("cpus")
+        cpus_requested = float(cpus_raw) if cpus_raw else None
+
+        # Parse memory_requested (new format has "memory" field)
+        memory_raw = get_val("memory")
+        memory_requested = parse_memory_value(memory_raw) if memory_raw else None
+
         process_execution_data.append({
             "id": unique_process_id,  
             "workflow_execution_id": workflow_id,  
             "process_name": process_name,
             "module_name": get_val("module") or "",
-            "container_name": get_val("container") or "",  # Dosyada yoksa boş kalır
+            "container_name": get_val("container") or "",
             "final_status": get_val("status"),
             "exit_code": exit_code,
             "start_time": parse_trace_time(get_val("submit", "start")),  
             "duration": duration_to_seconds(get_val("duration") or "0s"),
-            "cpus_requested": None, # Dosyada yok
+            "cpus_requested": cpus_requested,
             "time_requested": duration_to_seconds(get_val("time") or "0s"),  
             "storage_requested": parse_memory_value(get_val("disk")),  
-            "memory_requested": None, # Dosyada yok
+            "memory_requested": memory_requested,
             "realtime": duration_to_seconds(get_val("realtime") or "0s"),
             "queue_name": get_val("queue") or "",
             "percent_cpu": pct_cpu,
@@ -558,6 +566,7 @@ def find_and_group_runs(pipeline_info_dir: Path) -> Dict[str, Dict]:
 @app.command()
 def submit_directory(
     pipeline_info_dir: Path = typer.Argument(..., help="Path to the pipeline_info directory containing trace and bco files"),
+    work_dir: Optional[Path] = typer.Option(None, help="Path to the work directory for disk usage scanning"),
     api_key: str = typer.Option(None, help="API key for authentication")
 ):
     """
@@ -639,13 +648,58 @@ def submit_directory(
         for entry in process_execution_data:
             entry["institute_id"] = INSTITUTE_ID
         
+        # Scan work directory if provided (privacy-safe: only sizes, no filenames)
+        work_metrics = {}
+        if work_dir:
+            from work_scanner import scan_work_directory
+            # Extract task hashes from process execution data
+            task_hashes = []
+            for entry in process_execution_data:
+                # Extract hash from ID: format is "{workflow_id}_{hash}" where hash contains "/"
+                # Hash format is "XX/XXXXXX" so we look for the last underscore before the slash
+                entry_id = entry["id"]
+                # Find position of "/" and work backwards to find the underscore before it
+                slash_pos = entry_id.find("/")
+                if slash_pos > 0:
+                    # Find the underscore right before the directory prefix (XX/)
+                    underscore_pos = entry_id.rfind("_", 0, slash_pos - 1)
+                    if underscore_pos > 0:
+                        task_hash = entry_id[underscore_pos + 1:]
+                        task_hashes.append(task_hash)
+            
+            if task_hashes:
+                typer.echo(f"  Scanning work directory for {len(task_hashes)} tasks...")
+                work_metrics = scan_work_directory(str(work_dir), task_hashes)
+                typer.echo(f"  ✓ Scanned {len(work_metrics)} tasks")
+        
         for entry in process_execution_data:
+            # Extract hash to get work metrics (same logic as above)
+            entry_id = entry["id"]
+            slash_pos = entry_id.find("/")
+            task_hash = None
+            if slash_pos > 0:
+                underscore_pos = entry_id.rfind("_", 0, slash_pos - 1)
+                if underscore_pos > 0:
+                    task_hash = entry_id[underscore_pos + 1:]
+            
+            # Add work directory metrics if available (privacy-safe: only numbers)
+            if task_hash and task_hash in work_metrics:
+                metrics = work_metrics[task_hash]
+                entry["disk_usage_mb"] = metrics.get("disk_usage_mb")
+                entry["read_bytes"] = metrics.get("read_bytes")
+                entry["write_bytes"] = metrics.get("write_bytes")
+                entry["peak_vmem_mb"] = metrics.get("peak_vmem_mb")
+                entry["peak_rss_mb"] = metrics.get("peak_rss_mb")
+            
             response = requests.post(f"{API_BASE_URL}/processes/", json=entry, headers=headers)
             if response.status_code != 200:
                 typer.echo(f"  ✗ Failed to submit process {entry['process_name']}: {response.text}", err=True)
                 break
         else:
-            typer.echo(f"  ✓ Submitted {len(process_execution_data)} processes")
+            if work_metrics:
+                typer.echo(f"  ✓ Submitted {len(process_execution_data)} processes with disk metrics")
+            else:
+                typer.echo(f"  ✓ Submitted {len(process_execution_data)} processes")
         
         # Submit BCO provenance data if available
         if bco_file:

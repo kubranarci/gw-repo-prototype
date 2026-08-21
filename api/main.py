@@ -107,6 +107,13 @@ class ProcessExecution(SQLModel, table=True):
     peak_vmem: float
     read_char: float
     write_char: float
+    
+    # Work directory metrics (privacy-safe: ONLY numbers, no paths/filenames)
+    disk_usage_mb: Optional[float] = None
+    read_bytes: Optional[int] = None
+    write_bytes: Optional[int] = None
+    peak_vmem_mb: Optional[float] = None
+    peak_rss_mb: Optional[float] = None
 
     workflow_execution: Optional[WorkflowExecution] = Relationship(back_populates="process_executions")
     institut: Optional["Institut"] = Relationship(back_populates="process_executions")
@@ -943,19 +950,32 @@ def get_optimization_recommendations(
         dur_stats = calc_stats([r['duration'] for r in historical_data])
         
         # Calculate average CPUs from historical data
-        # If cpus_requested is missing, estimate from percent_cpu but cap reasonably
+        # Strategy: Trust explicit cpus_requested, only cap uncertain estimates
         avg_cpus = []
+        has_explicit_cpu_data = False
+        
         for r in historical_data:
-            if r.get('cpus_requested'):
+            if r.get('cpus_requested') and r['cpus_requested'] > 0:
+                # Trust explicit CPU requests from workflow - no artificial cap
+                # If user requested 16 CPUs for STAR, we honor that
                 avg_cpus.append(r['cpus_requested'])
-            elif r.get('percent_cpu'):
-                # Estimate from percent_cpu but cap at 4 (most tools are single-threaded or lightly parallel)
-                estimated = min(4, max(1, int(r['percent_cpu'] / 100)))
+                has_explicit_cpu_data = True
+            elif r.get('percent_cpu') and r['percent_cpu'] > 0:
+                # Estimate from percent_cpu only when explicit data unavailable
+                # Cap at 12 for estimates (uncertain data needs conservative bound)
+                estimated = min(12, max(1, int(round(r['percent_cpu'] / 100))))
                 avg_cpus.append(estimated)
         
-        # Use average, capped at 8 CPUs maximum for safety
+        # Use average - only cap if we're estimating (no explicit CPU data)
         if avg_cpus:
-            recommended_cpus = min(8, max(1, int(round(np.mean(avg_cpus)))))
+            avg_cpu_value = np.mean(avg_cpus)
+            
+            # If we have explicit CPU requests, trust them (no cap)
+            # If we're estimating from percent_cpu, cap at 12 for safety
+            if has_explicit_cpu_data:
+                recommended_cpus = max(1, int(round(avg_cpu_value)))
+            else:
+                recommended_cpus = min(12, max(1, int(round(avg_cpu_value))))
         else:
             recommended_cpus = 1
         
@@ -1042,17 +1062,20 @@ def get_all_optimizations(
                 COUNT(*) as sample_count
             FROM processexecution p
             LEFT JOIN co2footprint c ON p.id = c.process_execution_id
-            WHERE UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
-               OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name)
-            GROUP BY p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
-                     p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
-                     c.energy_consumption_mwh, c.co2e_mg
+            WHERE (UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
+               OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name))
             """
             
             opt_params = {"process_name": f"%{module_name}%"}
             if institute_id:
                 query_str += " AND p.institute_id = :institute_id"
                 opt_params["institute_id"] = institute_id
+            
+            query_str += """
+            GROUP BY p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
+                     p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
+                     c.energy_consumption_mwh, c.co2e_mg
+            """
             
             result = session.execute(text(query_str), opt_params)
             historical_data = [dict(row._mapping) for row in result]
@@ -1079,19 +1102,32 @@ def get_all_optimizations(
             dur_stats = calc_stats([r['duration'] for r in historical_data])
             
             # Calculate average CPUs from historical data
-            # Use actual values when available, cap at 16 for highly parallel tools
+            # Strategy: Trust explicit cpus_requested, only cap uncertain estimates
             avg_cpus = []
+            has_explicit_cpu_data = False
+            
             for r in historical_data:
-                if r.get('cpus_requested'):
+                if r.get('cpus_requested') and r['cpus_requested'] > 0:
+                    # Trust explicit CPU requests from workflow - no artificial cap
+                    # If user requested 16 CPUs for STAR, we honor that
                     avg_cpus.append(r['cpus_requested'])
-                elif r.get('percent_cpu'):
-                    # Estimate from percent_cpu (e.g., 800% = ~8 cores)
-                    estimated = min(16, max(1, int(r['percent_cpu'] / 100)))
+                    has_explicit_cpu_data = True
+                elif r.get('percent_cpu') and r['percent_cpu'] > 0:
+                    # Estimate from percent_cpu only when explicit data unavailable
+                    # Cap at 12 for estimates (uncertain data needs conservative bound)
+                    estimated = min(12, max(1, int(round(r['percent_cpu'] / 100))))
                     avg_cpus.append(estimated)
             
-            # Use average, capped at 16 CPUs for highly parallel tools
+            # Use average - only cap if we're estimating (no explicit CPU data)
             if avg_cpus:
-                recommended_cpus = min(16, max(1, int(round(np.mean(avg_cpus)))))
+                avg_cpu_value = np.mean(avg_cpus)
+                
+                # If we have explicit CPU requests, trust them (no cap)
+                # If we're estimating from percent_cpu, cap at 12 for safety
+                if has_explicit_cpu_data:
+                    recommended_cpus = max(1, int(round(avg_cpu_value)))
+                else:
+                    recommended_cpus = min(12, max(1, int(round(avg_cpu_value))))
             else:
                 recommended_cpus = 1
             

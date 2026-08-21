@@ -1,6 +1,49 @@
 # gw-repo-prototype
 An API prototype for storing provenance and resource usage information from Nextflow workflow executions, equipped with a Streamlit analytics dashboard and ML-based resource optimization.
 
+## Documentation
+
+- 📖 [Technical Documentation](doc/TECHNICAL_DOCS.md) - CPU recommendations, work directory scanning, API endpoints, troubleshooting
+- 📝 [Changelog](CHANGELOG.md) - Recent changes and version history
+
+## Quick Start
+
+```
+[ Nextflow Pipeline Execution ]
+       │
+       ├─────────────────────────┬─────────────────────────┬─────────────────────────┐
+       ▼                         ▼                         ▼                         ▼
+┌──────────────┐         ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+│     work     │         │ co2footprint │         │   bco.json   │         │  trace.txt   │
+│  directory   │         │  (trace/sum) │         │              │         │              │
+└──────────────┘         └──────────────┘         └──────────────┘         └──────────────┘
+       │                         │                         │                         │
+       └─────────────────────────┴────────────┬────────────┴─────────────────────────┘
+                                              ▼
+                                 [ ETL Script and API Client ]
+                                              │
+                                              ▼ (HTTP POST / Bearer Token)
+┌────────────────────────────────────────────────────────────────┐
+│                      Centralized Service                       │
+│                                                                │
+│                     ┌───────────────────┐                      │
+│                     │    GW RePO API    │◄──────┐              │
+│                     └───────┬───┬───────┘       │              │
+│       (Reads/Writes)        │   │               │ (REST API    │
+│       ┌─────────────────────┘   └───────┐       │  Queries)    │
+│       ▼                                 ▼       │              │
+│ ┌────────────┐                  ┌──────────────┐│              │
+│ │ PostgreSQL │                  │ ML Resource  ││              │
+│ │  Database  │                  │    Models    ││              │
+│ └────────────┘                  └──────────────┘│              │
+│                                                 │              │
+│                     ┌───────────────────┐       │              │
+│                     │ Streamlit UI App  ├───────┘              │
+│                     │   (User Facing)   │                      │
+│                     └───────────────────┘                      │
+└────────────────────────────────────────────────────────────────┘
+```
+
 ## Quick Start
 
 ```bash
@@ -102,7 +145,7 @@ The client script processes entire output directories containing execution trace
 Run the client to parse the metadata and submit it to the PostgreSQL database via the REST API:
 
 ```bash
-python client/client.py <path_to_pipeline_info_directory> [--api-key <your_api_key>]
+python client/client.py <path_to_pipeline_info_directory> [--work-dir <path_to_work_directory>] [--api-key <your_api_key>]
 ```
 
 **Parameters:**
@@ -111,7 +154,38 @@ python client/client.py <path_to_pipeline_info_directory> [--api-key <your_api_k
   - `manifest_*.bco.json` (optional, provenance data)
   - `co2footprint_trace_*.txt` (optional, CO2 per-process data)
   - `co2footprint_summary_*.txt` (optional, CO2 workflow summary)
+* `--work-dir`: Path to Nextflow work directory for disk usage scanning (optional)
 * `--api-key`: API key for authentication (optional if `API_KEY` is set in environment)
+
+### Work Directory Scanning
+
+When `--work-dir` is provided, the client automatically scans the work directory to extract additional metrics:
+
+```bash
+python client/client.py ./results/pipeline_info \
+    --work-dir ./results/work \
+    --api-key your_api_key_here
+```
+
+**Extracted Metrics** (privacy-safe - numbers only):
+- `disk_usage_mb`: Total disk space used by task (MB)
+- `read_bytes`: Bytes read from disk
+- `write_bytes`: Bytes written to disk
+- `peak_vmem_mb`: Peak virtual memory (MB)
+- `peak_rss_mb`: Peak resident memory (MB)
+
+**Privacy Guarantee**: The scanner NEVER stores file paths, filenames, or sample names - only numerical values.
+
+**Example Output**:
+```
+Found 1 workflow runs to process. Institute: DKFZ
+
+--- Processing Run: 2026-08-20_14-47-55 ---
+  ✓ Workflow submitted
+  Scanning work directory for 145 tasks...
+  ✓ Scanned 145 tasks
+  ✓ Submitted 145 processes with disk metrics
+```
 
 **Example:**
 ```bash

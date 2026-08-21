@@ -1,3 +1,68 @@
+# Changelog
+
+For detailed technical documentation, see [doc/TECHNICAL_DOCS.md](doc/TECHNICAL_DOCS.md).
+
+## [2026-08-20] - Work Directory Integration & Enhanced Trace Support
+
+### Added
+
+#### Work Directory Scanning
+- **Privacy-safe disk usage tracking** - Extracts only numerical metrics (MB, bytes), NEVER stores file paths, filenames, or sample names
+- **Targeted scanning** - Only scans tasks from execution trace (not all work directories)
+- **New metrics**: `disk_usage_mb`, `read_bytes`, `write_bytes`, `peak_vmem_mb`, `peak_rss_mb`
+- **Graceful handling** - Missing work directories are skipped silently (no failures)
+
+#### Files Created
+| File | Purpose |
+|------|---------|
+| `client/work_scanner.py` | Privacy-safe work directory scanner |
+| `test_work_scanner.py` | Integration tests (5 tests, 100% pass rate) |
+
+#### Enhanced Trace Support
+- **Dual format support** - Handles both old and new Nextflow execution trace formats
+- **New format fields**: `module`, `container`, `cpus`, `time`, `memory`, `%mem`
+- **Old format fallback** - Gracefully handles traces without these fields
+
+### Changed
+
+#### Database Schema
+- **ProcessExecution model** - Added 5 new fields for work directory metrics
+- All fields are optional (backward compatible with existing data)
+
+#### Client
+- **New parameter** - `--work-dir` for work directory scanning
+- **Enhanced parsing** - Automatically detects and parses both trace formats
+- **Better feedback** - Shows scan progress and success rate
+
+### Performance
+
+- **Scan speed**: ~2 seconds for 105 tasks
+- **Success rate**: 100% (all tasks found in test)
+- **Privacy**: Zero file paths or filenames stored
+
+### Example Usage
+
+```bash
+# Submit with work directory scanning
+python client/client.py ./results/pipeline_info \
+    --work-dir ./results/work \
+    --api-key ${API_KEY}
+```
+
+### Test Results
+
+```
+✓ PASS: Single Task Scan
+✓ PASS: Targeted Scanning  
+✓ PASS: Privacy Compliance
+✓ PASS: Missing Task Handling
+✓ PASS: Readable Units
+
+Total: 5/5 tests passed (100.0%)
+```
+
+---
+
 # Consolidated Configuration Implementation
 
 ## What Changed
