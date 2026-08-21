@@ -142,6 +142,67 @@ class ResourcePredictor:
         
         return metrics
     
+    def _calculate_confidence(
+        self, 
+        feature_df: pd.DataFrame, 
+        model_type: str,
+        prediction: float
+    ) -> float:
+        """
+        Calculate confidence score for a prediction based on:
+        1. Model's historical performance (R², CV scores)
+        2. Training sample count
+        3. Feature validity (no missing/zero features)
+        
+        Returns: Confidence score between 0.0 and 1.0
+        """
+        confidence = 0.5  # Base confidence
+        
+        # Factor 1: Model performance (R² score)
+        metadata = self.model_metadata.get(model_type, {})
+        if metadata.get('success'):
+            r2 = metadata.get('test_r2', 0)
+            cv_r2 = metadata.get('cv_r2_mean', 0)
+            
+            # R² contribution (up to 0.3 points)
+            # R² > 0.8: +0.3, R² > 0.6: +0.2, R² > 0.4: +0.1
+            if r2 > 0.8:
+                confidence += 0.3
+            elif r2 > 0.6:
+                confidence += 0.2
+            elif r2 > 0.4:
+                confidence += 0.1
+            
+            # CV consistency (up to 0.1 points)
+            # Low std dev means model is stable
+            cv_std = metadata.get('cv_r2_std', 1.0)
+            if cv_std < 0.05:
+                confidence += 0.1
+            elif cv_std < 0.1:
+                confidence += 0.05
+        
+        # Factor 2: Training sample count (up to 0.2 points)
+        training_samples = metadata.get('training_samples', 0)
+        if training_samples >= 500:
+            confidence += 0.2
+        elif training_samples >= 100:
+            confidence += 0.15
+        elif training_samples >= 50:
+            confidence += 0.1
+        elif training_samples >= 10:
+            confidence += 0.05
+        
+        # Factor 3: Feature validity (up to 0.1 points)
+        # Check if features have reasonable values (not all zeros/NaN)
+        feature_valid_ratio = (feature_df != 0).mean().mean() if not feature_df.empty else 0
+        if feature_valid_ratio > 0.8:
+            confidence += 0.1
+        elif feature_valid_ratio > 0.5:
+            confidence += 0.05
+        
+        # Cap confidence at 1.0
+        return min(1.0, confidence)
+    
     def predict(
         self, 
         features: Dict, 
@@ -186,19 +247,29 @@ class ResourcePredictor:
         model = self.models[model_type]
         prediction = model.predict(feature_scaled)[0]
         
-        # Calculate confidence (using feature similarity to training data)
-        # This is a simplified approach - in production, use quantile regression or ensemble variance
-        confidence_score = 0.7  # Default confidence
+        # Calculate confidence score based on multiple factors
+        confidence_score = self._calculate_confidence(
+            feature_df, model_type, prediction
+        )
         
         # Apply safety margin based on confidence
         # Lower confidence → higher safety margin
-        safety_margin = 1.0 + (1.0 - confidence_score) * 0.5
+        # High confidence (0.8+): 15% margin
+        # Medium confidence (0.5-0.8): 30% margin  
+        # Low confidence (<0.5): 50% margin
+        if confidence_score >= 0.8:
+            safety_margin = 1.15
+        elif confidence_score >= 0.5:
+            safety_margin = 1.30
+        else:
+            safety_margin = 1.50
         
         result = {
             'prediction': float(prediction),
             'prediction_with_safety': float(prediction * safety_margin),
             'safety_margin': safety_margin,
             'confidence': confidence_score,
+            'confidence_level': 'high' if confidence_score >= 0.8 else ('medium' if confidence_score >= 0.5 else 'low'),
             'model_version': self.model_metadata.get(model_type, {}).get('timestamp', 'unknown'),
             'success': True
         }
@@ -207,7 +278,7 @@ class ResourcePredictor:
         if confidence and 'test_rmse' in self.model_metadata.get(model_type, {}):
             rmse = self.model_metadata[model_type]['test_rmse']
             result['confidence_interval'] = {
-                'lower': float(prediction - 1.96 * rmse),
+                'lower': float(max(0, prediction - 1.96 * rmse)),
                 'upper': float(prediction + 1.96 * rmse),
                 'confidence_level': 0.95
             }

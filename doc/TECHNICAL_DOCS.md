@@ -6,10 +6,157 @@ This directory contains technical documentation for GW-Repo features and impleme
 
 ## Table of Contents
 
-1. [CPU Recommendation Strategy](#cpu-recommendation-strategy)
-2. [Work Directory Scanning](#work-directory-scanning)
-3. [Database Schema](#database-schema)
-4. [API Endpoints](#api-endpoints)
+1. [Institute & Pipeline Segmentation](#institute--pipeline-segmentation)
+2. [CPU Recommendation Strategy](#cpu-recommendation-strategy)
+3. [ML Confidence Scoring](#ml-confidence-scoring)
+4. [Work Directory Scanning](#work-directory-scanning)
+5. [Database Schema](#database-schema)
+6. [API Endpoints](#api-endpoints)
+
+---
+
+## Institute & Pipeline Segmentation
+
+### Overview
+
+GW-Repo provides **environment-specific recommendations** by segmenting data and ML models per institute (run environment).
+
+**Key Concept**: Recommendations are tailored to your specific hardware, storage, and workflow configurations.
+
+```
+Institute (DKFZ) + Pipeline (variantbenchmarking)
+       ↓
+Historical data tagged with institute_id
+       ↓
+ML models trained per institute
+       ↓
+Recommendations filtered by institute
+       ↓
+Results optimized for YOUR environment
+```
+
+### Why Institute Segmentation Matters
+
+Different institutes have different:
+- **Hardware**: CPU models (AMD EPYC vs Intel Xeon), RAM speeds, storage types (NVMe vs HDD)
+- **Configurations**: LSF vs SLURM, Singularity vs Docker, filesystem layouts
+- **Workloads**: Different pipelines, parameters, and data sizes
+
+**Example**: A workflow running at DKFZ might need 8 CPUs and 16GB RAM, but the same workflow at EMBL might need 12 CPUs and 24GB RAM due to hardware differences.
+
+### Implementation
+
+#### 1. Data Tagging
+
+All workflow executions are tagged with `institute_id`:
+
+```bash
+# Set institute during submission
+export INSTITUTE_ID=DKFZ
+python client/client.py ./results/pipeline_info
+```
+
+Database schema:
+```sql
+ALTER TABLE processexecution ADD COLUMN institute_id VARCHAR;
+ALTER TABLE workflowexecution ADD COLUMN institute_id VARCHAR;
+```
+
+#### 2. ML Model Training
+
+Models train separately for each institute:
+
+```bash
+# Train models for specific institute
+curl -X POST http://localhost/ml/train \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{"institute_id": "DKFZ"}'
+
+# Train models for all institutes (combined)
+curl -X POST http://localhost/ml/train \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{}'
+```
+
+Implementation in `api/ml/features.py`:
+```python
+def extract_process_features(session, institute_id=None):
+    query = select(ProcessExecution)
+    if institute_id:
+        query = query.where(ProcessExecution.institute_id == institute_id)
+    # ... rest of feature extraction
+```
+
+#### 3. Recommendations Filtering
+
+API endpoints automatically filter by institute:
+
+```bash
+# Get recommendations for DKFZ
+curl "http://localhost/ml/optimization/BCFTOOLS_FILTER?institute_id=DKFZ" \
+  -H "Authorization: Bearer $API_KEY"
+
+# Get recommendations for all institutes
+curl "http://localhost/ml/optimization/BCFTOOLS_FILTER" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+SQL filtering:
+```sql
+SELECT AVG(cpus_requested), AVG(peak_rss), ...
+FROM processexecution
+WHERE process_name LIKE '%BCFTOOLS_FILTER%'
+  AND institute_id = 'DKFZ'  -- ← Institute filter
+```
+
+### Best Practices
+
+#### Setting Institute ID
+
+```bash
+# Production clusters
+export INSTITUTE_ID=DKFZ    # DKFZ cluster
+export INSTITUTE_ID=EMBL    # EMBL cluster
+export INSTITUTE_ID=BROAD   # Broad Institute
+
+# Local development
+export INSTITUTE_ID=LOCAL   # Local machine
+export INSTITUTE_ID=DEV     # Development environment
+
+# Multi-cluster setups
+export INSTITUTE_ID=DKFZ_LSF    # DKFZ LSF cluster
+export INSTITUTE_ID=DKFZ_SLURM  # DKFZ SLURM cluster
+```
+
+#### Migrations Between Institutes
+
+If moving workflows between institutes:
+
+1. **Submit with new institute_id**: Data will be tagged separately
+2. **Retrain models**: `POST /ml/train?institute_id=NEW_INSTITUTE`
+3. **Compare recommendations**: Check if resource needs differ
+
+#### Multi-Institute Analysis
+
+Compare resource usage across institutes:
+
+```bash
+# Get recommendations for multiple institutes
+curl "http://localhost/ml/optimization/BCFTOOLS_FILTER?institute_id=DKFZ"
+curl "http://localhost/ml/optimization/BCFTOOLS_FILTER?institute_id=EMBL"
+
+# Analyze differences in Streamlit UI
+# Navigate to "Optimization" page and compare
+```
+
+### Streamlit UI Support
+
+The UI supports institute filtering:
+
+- **ML Training Page**: Select institute for training
+- **ML Predictions Page**: Filter by institute
+- **Optimization Page**: Institute-specific recommendations
+- **Dashboard Page**: Filter processes by institute
 
 ---
 
@@ -102,6 +249,185 @@ process STAR_ALIGN {
 ```
 
 The system will recommend **24 CPUs** (no cap - trusted explicit request).
+
+---
+
+## ML Confidence Scoring
+
+### Overview
+
+ML predictions include **confidence scores** to help users understand prediction reliability.
+
+**Confidence Levels**:
+- **High** (0.8-1.0): Trust prediction, 15% safety margin
+- **Medium** (0.5-0.8): Use with caution, 30% safety margin
+- **Low** (0.0-0.5): Consider manual tuning, 50% safety margin
+
+### Confidence Calculation
+
+Confidence is calculated based on multiple factors:
+
+```python
+confidence = base_confidence (0.5)
+           + model_performance (up to 0.4)
+           + sample_count (up to 0.2)
+           + feature_validity (up to 0.1)
+```
+
+#### Factor 1: Model Performance (Up to 0.4 Points)
+
+Based on model's R² and cross-validation scores:
+
+| R² Score | CV Std Dev | Confidence Added |
+|----------|------------|------------------|
+| > 0.8    | < 0.05     | +0.4 (0.3 + 0.1) |
+| > 0.6    | < 0.1      | +0.25 (0.2 + 0.05) |
+| > 0.4    | -          | +0.1             |
+| < 0.4    | -          | +0.0             |
+
+**Rationale**: High R² means model explains variance well. Low CV std dev means model is stable.
+
+#### Factor 2: Training Sample Count (Up to 0.2 Points)
+
+| Samples | Confidence Added |
+|---------|------------------|
+| ≥ 500   | +0.2             |
+| ≥ 100   | +0.15            |
+| ≥ 50    | +0.1             |
+| ≥ 10    | +0.05            |
+| < 10    | +0.0             |
+
+**Rationale**: More samples → more reliable predictions.
+
+#### Factor 3: Feature Validity (Up to 0.1 Points)
+
+Checks if input features have reasonable values:
+
+| Valid Features | Confidence Added |
+|----------------|------------------|
+| > 80%          | +0.1             |
+| > 50%          | +0.05            |
+| < 50%          | +0.0             |
+
+**Rationale**: All-zero or NaN features indicate data quality issues.
+
+### Example Predictions
+
+#### High Confidence Prediction
+
+```json
+{
+  "prediction": 512.5,
+  "prediction_with_safety": 589.4,
+  "safety_margin": 1.15,
+  "confidence": 0.85,
+  "confidence_level": "high",
+  "confidence_interval": {
+    "lower": 412.3,
+    "upper": 612.7,
+    "confidence_level": 0.95
+  }
+}
+```
+
+**Interpretation**: 
+- Model R² = 0.87, trained on 500+ samples
+- Trust the prediction (512.5 MB)
+- Safety margin: 15% → 589.4 MB recommended
+- 95% confidence interval: 412-613 MB
+
+#### Low Confidence Prediction
+
+```json
+{
+  "prediction": 1024.0,
+  "prediction_with_safety": 1536.0,
+  "safety_margin": 1.50,
+  "confidence": 0.35,
+  "confidence_level": "low"
+}
+```
+
+**Interpretation**:
+- Model R² = 0.32, trained on <50 samples
+- Prediction uncertain (1024 MB)
+- Safety margin: 50% → 1536 MB recommended (conservative)
+- Consider manual tuning or collecting more data
+
+### Safety Margins
+
+Safety margins protect against prediction uncertainty:
+
+| Confidence Level | Safety Margin | Use Case |
+|-----------------|---------------|----------|
+| High (0.8+)     | 15%           | Production workflows with good historical data |
+| Medium (0.5-0.8)| 30%           | New workflows or moderate historical data |
+| Low (<0.5)      | 50%           | Very new workflows or poor model performance |
+
+**Rationale**: Higher uncertainty → larger safety buffer to prevent OOM errors.
+
+### Implementation
+
+Located in `api/ml/models.py`:
+
+```python
+def _calculate_confidence(self, feature_df, model_type, prediction):
+    confidence = 0.5  # Base confidence
+    
+    # Factor 1: Model performance (R², CV scores)
+    metadata = self.model_metadata.get(model_type, {})
+    if metadata.get('test_r2', 0) > 0.8:
+        confidence += 0.3
+    elif metadata.get('test_r2', 0) > 0.6:
+        confidence += 0.2
+    
+    # Factor 2: Training sample count
+    training_samples = metadata.get('training_samples', 0)
+    if training_samples >= 500:
+        confidence += 0.2
+    elif training_samples >= 100:
+        confidence += 0.15
+    
+    # Factor 3: Feature validity
+    feature_valid_ratio = (feature_df != 0).mean().mean()
+    if feature_valid_ratio > 0.8:
+        confidence += 0.1
+    
+    return min(1.0, confidence)
+```
+
+### API Response Format
+
+```bash
+curl "http://localhost/ml/predict?process_name=BCFTOOLS_FILTER" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Response:
+```json
+{
+  "success": true,
+  "predictions": {
+    "memory": {
+      "value": 512.5,
+      "unit": "MB",
+      "confidence": 0.85,
+      "confidence_level": "high",
+      "safety_margin": 1.15,
+      "value_with_safety": 589.4
+    }
+  }
+}
+```
+
+### Improving Confidence
+
+To improve prediction confidence:
+
+1. **More historical data**: Run workflow 50+ times
+2. **Consistent configurations**: Avoid changing parameters frequently
+3. **Quality data**: Ensure trace files are complete and accurate
+4. **Retrain models**: `POST /ml/train` after collecting more data
 
 ---
 

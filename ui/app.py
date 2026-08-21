@@ -26,7 +26,28 @@ with st.sidebar:
     )
 
 def render_resource_charts(df: pd.DataFrame):
-    st.subheader("Process Resource Utilization")
+    # Show data table FIRST - with ALL columns for debugging
+    st.subheader("Detailed Process Data Table")
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        # Create a copy and sanitize process_name to remove sample names
+        display_df = df.copy()
+        
+        # PRIVACY FIX: Remove sample names from process_name
+        # "NFCORE:...:BCFTOOLS_REHEADER (test6)" → "BCFTOOLS_REHEADER"
+        if 'process_name' in display_df.columns:
+            display_df['process_name'] = display_df['process_name'].apply(
+                lambda x: re.sub(r'\s*\(.*\)', '', str(x)) if isinstance(x, str) else str(x)
+            )
+        
+        # Show ALL columns for debugging
+        st.dataframe(display_df, use_container_width=True)
+    else:
+        st.info("No data available")
+    
+    st.divider()
+    
+    # Then show visualizations
+    st.subheader("Process Resource Visualizations")
     
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         st.warning("No data found to display.")
@@ -38,8 +59,13 @@ def render_resource_charts(df: pd.DataFrame):
 
     work_df = df.copy()
     
+    # PRIVACY FIX: Sanitize process names everywhere
+    work_df['process_name'] = work_df['process_name'].apply(
+        lambda x: re.sub(r'\s*\(.*\)', '', str(x)) if isinstance(x, str) else str(x)
+    )
+    
     work_df['short_name'] = work_df['process_name'].apply(
-        lambda x: re.sub(r'\s*\(.*\)', '', x.split(':')[-1]) if isinstance(x, str) else str(x)
+        lambda x: x.split(':')[-1] if isinstance(x, str) else str(x)
     )
     
     if 'start_time' in work_df.columns:
@@ -67,7 +93,9 @@ def render_resource_charts(df: pd.DataFrame):
         st.info("No data matches the selected filters.")
         return
 
-    numeric_cols = ['duration', 'peak_rss', 'percent_cpu', 'realtime', 'peak_vmem', 'storage_requested', 'time_requested']
+    numeric_cols = ['duration', 'peak_rss', 'percent_cpu', 'realtime', 'peak_vmem', 
+                    'storage_requested', 'time_requested', 'disk_usage_mb', 
+                    'read_bytes', 'write_bytes', 'peak_vmem_mb', 'peak_rss_mb']
     available_numeric = [col for col in numeric_cols if col in filtered_df.columns]
     
     avg_df = filtered_df.groupby('short_name')[available_numeric].mean().reset_index()
@@ -79,7 +107,12 @@ def render_resource_charts(df: pd.DataFrame):
         'realtime': 'Average Realtime (seconds)',
         'peak_vmem': 'Average Peak Virtual Memory (MB)',
         'storage_requested': 'Average Storage Requested (MB)',
-        'time_requested': 'Average Time Requested (seconds)'
+        'time_requested': 'Average Time Requested (seconds)',
+        'disk_usage_mb': 'Average Disk Usage (MB)',
+        'read_bytes': 'Average Read Bytes',
+        'write_bytes': 'Average Write Bytes',
+        'peak_vmem_mb': 'Average Peak VMEM (MB)',
+        'peak_rss_mb': 'Average Peak RSS (MB)'
     }
 
     selected_metric = st.selectbox(
@@ -97,35 +130,73 @@ def render_resource_charts(df: pd.DataFrame):
     )
     fig.update_layout(xaxis_tickangle=-45, margin=dict(b=100))
     st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Optimized Config Generator")
-    st.write("Generate an automated configuration file based on average empirical metrics with a safety factor.")
     
-    if st.button("Generate optimized.config"):
-        config_lines = ["process {"]
-        for _, row in avg_df.iterrows():
-            proc_name = row['short_name']
-            avg_duration = max(int(row.get('duration', 60)), 10)
-            avg_rss = max(int(row.get('peak_rss', 512)), 256)
-            
-            config_lines.append(f"    withName: '{proc_name}' {{")
-            config_lines.append(f"        cpus = 2")
-            config_lines.append(f"        memory = '{int(avg_rss * 1.3)} MB'")
-            config_lines.append(f"        time = '{int(avg_duration * 1.5)}s'")
-            config_lines.append("    }")
-        config_lines.append("}")
+    # Enhanced CPU Visualization
+    if 'percent_cpu' in filtered_df.columns and not filtered_df['percent_cpu'].isna().all():
+        st.subheader("CPU Utilization Distribution")
         
-        config_content = "\n".join(config_lines)
-        st.code(config_content, language="groovy")
-        st.download_button(
-            label="Download optimized.config File",
-            data=config_content,
-            file_name="optimized.config",
-            mime="text/plain"
-        )
+        cpu_data = filtered_df[['short_name', 'percent_cpu']].dropna()
+        if not cpu_data.empty:
+            fig_cpu = px.box(
+                cpu_data,
+                x='short_name',
+                y='percent_cpu',
+                title='CPU Utilization Distribution by Process (shows variability and outliers)',
+                labels={'short_name': 'Process', 'percent_cpu': 'CPU Utilization (%)'}
+            )
+            fig_cpu.update_layout(xaxis_tickangle=-45, margin=dict(b=100))
+            st.plotly_chart(fig_cpu, use_container_width=True)
+            
+            # CPU utilization histogram
+            fig_hist = px.histogram(
+                filtered_df,
+                x='percent_cpu',
+                color='short_name',
+                title='CPU Utilization Histogram',
+                labels={'percent_cpu': 'CPU Utilization (%)', 'count': 'Count'}
+            )
+            fig_hist.update_layout(margin=dict(b=100))
+            st.plotly_chart(fig_hist, use_container_width=True)
+    
+    # Disk Usage Visualization
+    disk_cols = [col for col in ['disk_usage_mb', 'read_bytes', 'write_bytes'] if col in filtered_df.columns]
+    if disk_cols and not all(filtered_df[col].isna().all() for col in disk_cols):
+        st.subheader("Disk I/O & Storage Metrics")
+        
+        # Disk usage bar chart
+        if 'disk_usage_mb' in filtered_df.columns and not filtered_df['disk_usage_mb'].isna().all():
+            disk_df = filtered_df[['short_name', 'disk_usage_mb']].dropna()
+            if not disk_df.empty:
+                fig_disk = px.bar(
+                    disk_df.groupby('short_name')['disk_usage_mb'].mean().reset_index(),
+                    x='short_name',
+                    y='disk_usage_mb',
+                    title='Average Disk Usage by Process (MB)',
+                    labels={'short_name': 'Process', 'disk_usage_mb': 'Disk Usage (MB)'}
+                )
+                fig_disk.update_layout(xaxis_tickangle=-45, margin=dict(b=100))
+                st.plotly_chart(fig_disk, use_container_width=True)
+        
+        # Read/Write bytes comparison
+        if 'read_bytes' in filtered_df.columns and 'write_bytes' in filtered_df.columns:
+            io_df = filtered_df[['short_name', 'read_bytes', 'write_bytes']].dropna()
+            if not io_df.empty:
+                io_avg = io_df.groupby('short_name')[['read_bytes', 'write_bytes']].mean().reset_index()
+                io_melted = io_avg.melt(id_vars=['short_name'], value_vars=['read_bytes', 'write_bytes'],
+                                       var_name='IO Type', value_name='Bytes')
+                
+                fig_io = px.bar(
+                    io_melted,
+                    x='short_name',
+                    y='Bytes',
+                    color='IO Type',
+                    title='Average I/O Bytes by Process',
+                    barmode='group',
+                    labels={'short_name': 'Process', 'IO Type': 'Operation Type'}
+                )
+                fig_io.update_layout(xaxis_tickangle=-45, margin=dict(b=100))
+                st.plotly_chart(fig_io, use_container_width=True)
 
-    st.subheader("Detailed Process Data Table")
-    st.dataframe(filtered_df, use_container_width=True)
 
 @st.cache_data
 def fetch_process_data(api_key_val):

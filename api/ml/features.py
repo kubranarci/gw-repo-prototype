@@ -44,6 +44,11 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
         p.read_char,
         p.write_char,
         p.duration,
+        p.disk_usage_mb,
+        p.read_bytes,
+        p.write_bytes,
+        p.peak_vmem_mb,
+        p.peak_rss_mb,
         p.institute_id,
         w.run_name,
         w.nextflow_version,
@@ -91,9 +96,14 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
     # Time efficiency
     df['time_efficiency'] = df['duration'] / df['time_requested'].replace(0, np.nan)
     
-    # 3. I/O intensity
+    # 3. I/O intensity (character I/O from trace)
     df['io_total'] = df['read_char'] + df['write_char']
     df['io_ratio'] = df['read_char'] / (df['write_char'] + 1)
+    
+    # 3b. Disk I/O intensity (from work directory scanning)
+    df['disk_io_total'] = df['read_bytes'].fillna(0) + df['write_bytes'].fillna(0)
+    df['disk_io_ratio'] = df['read_bytes'].fillna(0) / (df['write_bytes'].fillna(0) + 1)
+    df['disk_intensity'] = df['disk_usage_mb'].fillna(0)
     
     # 4. CPU-Memory correlation
     df['cpu_mem_product'] = df['percent_cpu'] * df['peak_rss']
@@ -122,9 +132,21 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
     df['target_duration_sec'] = df['duration']
     
     # CPU prediction target (number of cores)
-    df['target_cpus'] = df['cpus_requested'].fillna(
-        df['percent_cpu'].apply(lambda x: max(1, int(x / 100)) if pd.notna(x) else 1)
-    )
+    # Priority: 1) Use explicit cpus_requested, 2) Estimate from percent_cpu
+    # For percent_cpu: if > 100%, tool is using multiple cores
+    # Estimate: cores = percent_cpu / 100, but cap at reasonable values
+    def estimate_cpus(row):
+        if pd.notna(row['cpus_requested']) and row['cpus_requested'] > 0:
+            return row['cpus_requested']
+        elif pd.notna(row['percent_cpu']) and row['percent_cpu'] > 0:
+            # If percent_cpu > 100, likely multi-threaded
+            # Use ceiling division but cap at 16 for wild estimates
+            estimated = int(np.ceil(row['percent_cpu'] / 100))
+            return min(16, max(1, estimated))
+        else:
+            return 1
+    
+    df['target_cpus'] = df.apply(estimate_cpus, axis=1)
     
     return df
 
@@ -147,6 +169,9 @@ def prepare_training_data(df: pd.DataFrame, target: str = 'target_memory_mb') ->
         'memory_utilization',
         'io_total',
         'io_ratio',
+        'disk_io_total',
+        'disk_io_ratio',
+        'disk_intensity',
         'cpu_mem_product',
         'institute_encoded',
         'cpu_encoded',
@@ -162,27 +187,27 @@ def prepare_training_data(df: pd.DataFrame, target: str = 'target_memory_mb') ->
     # Filter to rows with valid target
     df_clean = df[df[target].notna()].copy()
     
-    # Define categorical columns first
+    # Define categorical columns
     categorical_cols = ['process_base']
     
-    # Convert ALL columns to numeric except categorical ones
-    all_cols = df_clean.columns.tolist()
-    for col in all_cols:
-        if col not in categorical_cols and col not in ['id', 'process_name', 'module_name', 'container_name', 'run_name', 'institute_id', 'cpu_model', target]:
+    # Convert feature columns to numeric (EXPLICIT selection)
+    for col in feature_columns:
+        if col in df_clean.columns:
             df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0)
+        else:
+            # Feature not available, create as zeros
+            df_clean[col] = 0
     
-    # One-hot encoding
+    # One-hot encoding for categorical features
     df_encoded = pd.get_dummies(df_clean, columns=categorical_cols, drop_first=True)
     
-    # Get feature matrix and target
-    exclude_cols = ['id', 'process_name', 'module_name', 'container_name', 'run_name', 
-                    'institute_id', 'cpu_model', 'process_base', 'nextflow_version', target]
-    feature_cols_final = [c for c in df_encoded.columns if c not in exclude_cols]
+    # Get final feature columns (from our explicit list + one-hot encoded categoricals)
+    feature_cols_final = [c for c in df_encoded.columns if c in feature_columns or c.startswith('process_base_')]
     
     # Ensure all features are numeric
     X = df_encoded[feature_cols_final].apply(pd.to_numeric, errors='coerce').fillna(0)
     X = X.replace([np.inf, -np.inf], 0)
-    y = pd.to_numeric(df_encoded[target], errors='coerce').fillna(0)
+    y = pd.to_numeric(df_clean[target], errors='coerce').fillna(0)
     
     return X, y, feature_cols_final
 

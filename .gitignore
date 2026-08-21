@@ -1,5 +1,8 @@
-  # Streamlit agent skills (environment-specific symlinks)
-  .agents/skills/developing-with-streamlit
-  client/.env
-  app/.env
-  db/.env
+# Streamlit agent skills (environment-specific symlinks)
+.agents/skills/developing-with-streamlit/*
+.agents/skills/*
+.agents/*
+client/.env
+api/.env
+db/.env
+.env

@@ -1,12 +1,6 @@
 # gw-repo-prototype
 An API prototype for storing provenance and resource usage information from Nextflow workflow executions, equipped with a Streamlit analytics dashboard and ML-based resource optimization.
 
-## Documentation
-
-- 📖 [Technical Documentation](doc/TECHNICAL_DOCS.md) - CPU recommendations, work directory scanning, API endpoints, troubleshooting
-- 📝 [Changelog](CHANGELOG.md) - Recent changes and version history
-
-## Quick Start
 
 ```
 [ Nextflow Pipeline Execution ]
@@ -43,6 +37,10 @@ An API prototype for storing provenance and resource usage information from Next
 │                     └───────────────────┘                      │
 └────────────────────────────────────────────────────────────────┘
 ```
+## Documentation
+
+- 📖 [Technical Documentation](doc/TECHNICAL_DOCS.md) - CPU recommendations, work directory scanning, API endpoints, troubleshooting
+- 📝 [Changelog](CHANGELOG.md) - Recent changes and version history
 
 ## Quick Start
 
@@ -56,12 +54,39 @@ The `setup.sh` script will:
 - Create the consolidated `.env` configuration file
 - Initialize the database schema
 
+## Deployment Model
+
+**Each user runs their own isolated GW-Repo instance:**
+
+```
+Your Machine
+└── Docker Compose
+    ├── API Container (port 80)
+    ├── PostgreSQL Database (port 5432) ← Your private database
+    └── Streamlit Dashboard (port 8501)
+```
+
+**Key Points**:
+- ✅ **Private**: Your workflow data stays on your machine
+- ✅ **Isolated**: No sharing with other users
+- ✅ **Self-contained**: Everything runs in Docker containers
+- ✅ **Your data**: PostgreSQL database is yours alone
+- ✅ **Your models**: ML models train only on YOUR workflow data
+
+**Why this design?**
+- Genomic workflow data is often sensitive
+- Different institutes have different hardware (recommendations are environment-specific)
+- Simple deployment: no central service to maintain
+- Works offline, no internet required after setup
+
 ## Data Persistence
 
-**Data is stored permanently** in a PostgreSQL volume and persists across:
+**Data is stored permanently** in a PostgreSQL Docker volume and persists across:
 - `docker compose down` / `docker compose up -d`
 - Container restarts
 - System reboots
+
+**Storage location**: `/var/lib/docker/volumes/gw-repo-db-data`
 
 **To delete all data:**
 ```bash
@@ -75,6 +100,15 @@ docker compose exec db psql -U postgres -d gw_repo -c "\dt"  # List tables
 docker compose exec db psql -U postgres -d gw_repo -c "SELECT COUNT(*) FROM workflowexecution;"  # Count workflows
 ```
 
+**Backup your data:**
+```bash
+# Manual backup
+docker compose exec db pg_dump -U postgres gw_repo > backup-$(date +%Y%m%d).sql
+
+# Restore from backup
+docker compose exec db psql -U postgres -d gw_repo < backup-20260821.sql
+```
+
 ## Client Requirements & Setup
 
 Install Python dependencies:
@@ -84,12 +118,6 @@ pip install typer requests python-dotenv streamlit plotly pandas
 ```
 
 ### Nextflow Configuration
-
-**Quick Start**: Use the provided configuration file when running your workflows:
-
-```bash
-nextflow run main.nf -profile docker/singularity/conda -c path/to/gwrepo.config -c ...
-```
 
 **Manual Configuration**: Enable process trace, nf-prov, and nf-co2footprint plugins in your `nextflow.config`:
 
@@ -120,7 +148,7 @@ co2footprint {
 }
 ```
 
-Run your SLURM or local workflows as usual. Ensure the pipeline metadata (trace, bco, and co2footprint files) is generated in the target execution directory.
+Run your SLURM, LSF or local workflows as usual. Ensure the pipeline metadata (trace, bco, and co2footprint files) is generated in the target execution directory.
 
 ### Client Environment Configuration
 
@@ -130,13 +158,17 @@ The root `.env` file (created by `setup.sh`) contains all required variables. Ex
 export $(cat .env | xargs)
 ```
 
-Or set `INSTITUTE_ID` to override the default:
+#### Institute ID (IMPORTANT)
+
+Set `INSTITUTE_ID` to tag your workflow data. This enables **environment-specific recommendations**:
 
 ```bash
-export INSTITUTE_ID=DKFZ
+export INSTITUTE_ID=DKFZ    # DKFZ cluster
 ```
 
-INSTITUTE_ID can also be `LOCAL`, `NONE`, `UNKNOWN`
+**Why this matters**: ML models train separately for each institute, so recommendations are tailored to your specific hardware and environment.
+
+**Valid values**: Any string (e.g., `DKFZ`, `EMBL`, `LOCAL`, `NONE`, `UNKNOWN`, or custom institute names)
 
 ## Submitting Execution Data
 
@@ -145,6 +177,7 @@ The client script processes entire output directories containing execution trace
 Run the client to parse the metadata and submit it to the PostgreSQL database via the REST API:
 
 ```bash
+export API_KEY=your_api_key_here
 python client/client.py <path_to_pipeline_info_directory> [--work-dir <path_to_work_directory>] [--api-key <your_api_key>]
 ```
 
@@ -157,24 +190,16 @@ python client/client.py <path_to_pipeline_info_directory> [--work-dir <path_to_w
 * `--work-dir`: Path to Nextflow work directory for disk usage scanning (optional)
 * `--api-key`: API key for authentication (optional if `API_KEY` is set in environment)
 
-### Work Directory Scanning
-
 When `--work-dir` is provided, the client automatically scans the work directory to extract additional metrics:
 
-```bash
-python client/client.py ./results/pipeline_info \
-    --work-dir ./results/work \
-    --api-key your_api_key_here
-```
-
-**Extracted Metrics** (privacy-safe - numbers only):
+**Extracted Metrics**:
 - `disk_usage_mb`: Total disk space used by task (MB)
 - `read_bytes`: Bytes read from disk
 - `write_bytes`: Bytes written to disk
 - `peak_vmem_mb`: Peak virtual memory (MB)
 - `peak_rss_mb`: Peak resident memory (MB)
 
-**Privacy Guarantee**: The scanner NEVER stores file paths, filenames, or sample names - only numerical values.
+**Note**: The scanner NEVER stores file paths, filenames, or sample names - only numerical values.
 
 **Example Output**:
 ```
@@ -185,16 +210,6 @@ Found 1 workflow runs to process. Institute: DKFZ
   Scanning work directory for 145 tasks...
   ✓ Scanned 145 tasks
   ✓ Submitted 145 processes with disk metrics
-```
-
-**Example:**
-```bash
-# Using API_KEY environment variable
-export API_KEY=your_api_key_here
-python client/client.py ./results/pipeline_info
-
-# Or pass API key directly
-python client/client.py ./results/pipeline_info --api-key your_api_key_here
 ```
 
 ## Visualization Dashboard
@@ -243,11 +258,37 @@ The dashboard provides 5 pages:
 
 The system includes machine learning capabilities for resource prediction and optimization:
 
+### Institute & Pipeline-Based Recommendations
+
+**Key Concept**: Recommendations are **specific to your environment** (institute + pipeline).
+
+```
+Institute (e.g., DKFZ) + Pipeline (e.g., variantbenchmarking)
+       ↓
+Historical executions from YOUR environment
+       ↓
+ML models trained on YOUR data
+       ↓
+Recommendations optimized for YOUR hardware & workflows
+```
+
+**Why this matters**:
+- Different institutes have different hardware (CPU models, storage speeds)
+- Different pipelines have different resource patterns
+- Recommendations from DKFZ may not apply to EMBL, and vice versa
+
+**How it works**:
+1. Submit workflow data with `INSTITUTE_ID` set (e.g., `DKFZ`, `EMBL`, `LOCAL`)
+2. ML models train separately for each institute
+3. Recommendations filter by institute automatically
+4. Results are tailored to your specific environment
+
 ### Model Architecture
 - **Algorithm**: Gradient Boosting Regressor with 5-fold cross-validation
 - **Targets**: Memory (MB), Duration (seconds), CPU utilization (cores)
 - **Features**: 80+ features including resource requests, utilization metrics, I/O ratios, CO2 footprint
 - **Safety Margins**: P95-based recommendations for production deployments
+- **Environment-Specific**: Models trained per-institute for hardware-aware predictions
 
 ### Training the Models
 
