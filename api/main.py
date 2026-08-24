@@ -540,6 +540,11 @@ def train_ml_models(
                 "message": "ML module not properly installed"
             }
         
+        import os
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+        import os
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+        print(f"📦 Training ML models in: {model_dir}")
         print(f"Training ML models{'for institute ' + institute_id if institute_id else 'for all institutes'}...")
         
         # Extract features from database
@@ -557,8 +562,8 @@ def train_ml_models(
         # Get feature statistics
         stats = get_feature_statistics(df)
         
-        # Train models
-        training_results = train_all_models(df)
+        # Train models with explicit local model directory
+        training_results = train_all_models(df, model_dir=model_dir)
         
         # Register models in database
         for model_type, metrics in training_results.items():
@@ -597,14 +602,115 @@ def train_ml_models(
         }
 
 
+@app.post("/ml/retrain")
+def retrain_ml_models(
+    institute_id: Optional[str] = None,
+    prioritize_failures: bool = True,
+    session: Session = Depends(get_session),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Manually retrain ML models with new data.
+    
+    Args:
+        institute_id: Optional institute to train on (None = all institutes)
+        prioritize_failures: If True, weight failure data points 2x higher
+    """
+    try:
+        try:
+            from ml.features import extract_process_features, get_feature_statistics
+            from ml.models import train_all_models, ResourcePredictor
+        except ImportError as e:
+            return {
+                "success": False,
+                "error": f"Import error: {str(e)}",
+                "message": "ML module not properly installed"
+            }
+        
+        import os
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+        import os
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+        print(f"📦 Retraining ML models in: {model_dir}")
+        print(f"Retraining ML models{'for institute ' + institute_id if institute_id else 'for all institutes'}...")
+        
+        # Extract features from database
+        df = extract_process_features(session, institute_id)
+        
+        if df.empty:
+            return {
+                "success": False,
+                "error": "No training data found",
+                "message": "Submit more workflow execution data first"
+            }
+        
+        print(f"Extracted {len(df)} process records for training")
+        
+        # Get feature statistics
+        stats = get_feature_statistics(df)
+        
+        # Train models with failure prioritization and explicit model directory
+        training_results = train_all_models(df, model_dir=model_dir, prioritize_failures=prioritize_failures)
+        
+        # Clear existing model metadata and register new ones
+        session.exec(select(Mlmodelmetadata).where(Mlmodelmetadata.model_name.like("resource_%"))).delete()
+        
+        for model_type, metrics in training_results.items():
+            if isinstance(metrics, dict) and metrics.get('success', False):
+                # Register both mean and P95 models
+                for model_variant in ['mean_model', 'p95_model']:
+                    if model_variant in metrics:
+                        variant_metrics = metrics[model_variant]
+                        model_meta = Mlmodelmetadata(
+                            model_name=f"resource_{model_type}_{model_variant.split('_')[0]}_predictor",
+                            model_version=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
+                            model_type="regression",
+                            target_process=model_type,
+                            training_samples=variant_metrics.get('training_samples', 0),
+                            accuracy_metrics=json.dumps({
+                                'test_r2': float(variant_metrics.get('test_r2', 0)),
+                                'test_rmse': float(variant_metrics.get('test_rmse', 0)),
+                                'test_mae': float(variant_metrics.get('test_mae', 0)),
+                                'cv_r2_mean': float(variant_metrics.get('cv_r2_mean', 0)),
+                            }),
+                            model_artifact_path=f"/code/models/{model_type}_{model_variant.split('_')[0]}_model.joblib"
+                        )
+                        session.add(model_meta)
+        
+        session.commit()
+        
+        # Count failures in dataset
+        failure_count = df['failure_reason'].notna().sum() if 'failure_reason' in df.columns else 0
+        
+        return {
+            "success": True,
+            "message": f"Retrained {len([m for m in training_results.values() if isinstance(m, dict) and m.get('success')])} models",
+            "training_samples": len(df),
+            "failure_samples": failure_count,
+            "prioritized_failures": prioritize_failures and failure_count > 0,
+            "feature_statistics": convert_numpy_types({k: v for k, v in stats.items() if k != 'process_distribution'}),
+            "model_results": convert_numpy_types(training_results)
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Retraining failed - check server logs"
+        }
+
+
 def extract_module_name(process_name: str) -> str:
     """
     Extract clean module name from process name.
     
     Examples:
         NFCORE:...:TABIX_BGZIPTABIX_GT (test12) -> TABIX_BGZIPTABIX_GT
-        NFCORE:...:BCFTOOLS_FILTER_QUERY_FP (test1) -> BCFTOOLS_FILTER_QUERY_FP
+        NFCORE:...:BCFTOOLS_FILTER_QUERY_FP (test1) -> BCFTOOLS_FILTER
         NFCORE:...:BCFTOOLS_NORM (test1) -> BCFTOOLS_NORM
+        NFCORE:...:SOMPY_QUERY (test1) -> SOMPY
     """
     # Remove the (instance) part
     base = process_name.split(' (')[0] if ' (' in process_name else process_name
@@ -614,10 +720,19 @@ def extract_module_name(process_name: str) -> str:
     else:
         module = base
     
-    # Only remove numeric instance suffixes like _1, _2
-    # Keep descriptive suffixes like _FILTER, _QUERY, _FP, _TP, etc.
+    # Remove numeric instance suffixes like _1, _2
     if module.endswith('_1') or module.endswith('_2'):
         module = module[:-2]
+    
+    # Remove test condition suffixes (these are NOT different tools)
+    # _QUERY, _TRUTH: Benchmarking test conditions
+    # _FP, _TP: False positive / True positive test modes
+    # _TEST, _EVAL: Evaluation modes
+    test_suffixes = ['_QUERY', '_TRUTH', '_FP', '_TP', '_TEST', '_EVAL']
+    for suffix in test_suffixes:
+        if module.endswith(suffix):
+            module = module[:-len(suffix)]
+            break
     
     return module
 
@@ -651,25 +766,36 @@ def format_memory(mb_value: float) -> str:
         return f"{gb_value} GB"
 
 
-def round_time(seconds: float) -> str:
-    """Round time to practical values with minimum 30 seconds."""
+def round_time(seconds: float, minimum_seconds: int = 3600) -> str:
+    """
+    Round time to practical values with MINIMUM 1 HOUR (3600s).
+    
+    Args:
+        seconds: Time in seconds
+        minimum_seconds: Minimum time (default 3600 = 1 hour for ML predictions)
+    """
+    # CRITICAL: Enforce minimum time (1 hour for ML predictions)
+    seconds = max(seconds, minimum_seconds)
+    
     if seconds <= 0:
-        return "30s"
-    # Apply 4x safety margin
-    safe_seconds = seconds * 4
-    if safe_seconds < 30:
-        return "30s"
-    elif safe_seconds < 60:
+        return "1h"
+    
+    # For ML predictions: NO additional safety margin (P99 already conservative)
+    # For historical stats: Apply 1.5x margin
+    safe_seconds = seconds
+    
+    if safe_seconds < 60:
         return "1m"
-    elif safe_seconds < 300:
-        return f"{int(safe_seconds / 60) * 60}s"  # Round to nearest minute
-    else:
+    elif safe_seconds < 3600:
         minutes = int(safe_seconds / 60)
-        if minutes < 60:
-            return f"{minutes}m"
+        return f"{minutes}m"
+    else:
+        hours = int(safe_seconds / 3600)
+        remaining_minutes = int((safe_seconds % 3600) / 60)
+        if remaining_minutes > 0:
+            return f"{hours}h{remaining_minutes}m"
         else:
-            hours = int(minutes / 60)
-            return f"{hours}h{minutes % 60}m" if minutes % 60 > 0 else f"{hours}h"
+            return f"{hours}h"
 
 
 @app.get("/ml/processes")
@@ -740,7 +866,7 @@ def predict_resources(
             return {
                 "success": False,
                 "error": "No trained models available",
-                "message": "Train models first using POST /ml/train"
+                "message": "ML models must be trained first. Run: python client.py submit_directory <path> --retrain"
             }
         
         # Get historical data for this module (extract base module name, ignore instance suffix)
@@ -787,6 +913,7 @@ def predict_resources(
             }
         
         # Build feature vector from historical averages
+        # MUST include ALL features that ML models were trained on
         features = {
             'cpus_requested': row.cpus_requested or 0,
             'time_requested': row.time_requested or 0,
@@ -817,6 +944,10 @@ def predict_resources(
             'process_base': row.process_name_full.split('_')[-1].split()[0] if '_' in (row.process_name_full or '') else (row.process_name_full or process_name).split()[0],
             'institute_encoded': 0,
             'cpu_encoded': 0,
+            # CRITICAL: Add disk features for time prediction minimum scaling
+            'disk_usage_mb': 0,  # Will be 0 for ML predictions (not available in this context)
+            'read_bytes': row.read_char or 0,  # Use read_char as proxy
+            'write_bytes': row.write_char or 0,  # Use write_char as proxy
         }
         
         # Encode institute
@@ -826,42 +957,66 @@ def predict_resources(
         # Use clean module name for response
         module_name = extract_module_name(row.process_name_full or process_name)
         
-        # Get predictions for all resource types
+        # Get predictions for all resource types with resource-specific percentiles
+        # Memory: P95 (avoid OOM), Time: P99 (avoid timeout), CPU: P75 (efficient)
         predictions = {}
         
         for resource_type in ['memory', 'time', 'cpu']:
             result = predictor.predict(features, resource_type)
             if result.get('success'):
+                # Determine primary percentile based on resource type
+                if resource_type == 'time':
+                    primary_key = 'prediction_p99'  # Most conservative for time
+                    primary_label = 'P99'
+                elif resource_type == 'cpu':
+                    primary_key = 'prediction_p75'  # Efficient for CPU
+                    primary_label = 'P75'
+                else:
+                    primary_key = 'prediction_p95'  # Conservative for memory
+                    primary_label = 'P95'
+                
                 predictions[resource_type] = {
-                    'value': result['prediction_with_safety'],
+                    'value': result.get(primary_key, result.get('prediction_p95', 0)),
+                    'value_mean': result['prediction_mean'],
+                    'percentile_used': primary_label,
                     'unit': 'MB' if resource_type == 'memory' else ('seconds' if resource_type == 'time' else 'cores'),
                     'confidence': result['confidence'],
-                    'safety_margin': result['safety_margin'],
+                    'safety_margin': result.get('safety_margin', 1),
+                    'all_percentiles': {k: v for k, v in result.items() if k.startswith('prediction_')},
                 }
+                
+                # For time, show both P95 and P99
+                if resource_type == 'time':
+                    predictions[resource_type]['p95'] = result.get('prediction_p95')
+                    predictions[resource_type]['p99'] = result.get('prediction_p99')
+                    predictions[resource_type]['time_minimum'] = result.get('time_minimum_applied', 3600)
         
-        # Calculate CPU from historical data
-        # Use actual average when available, only cap at reasonable maximum (16 CPUs)
-        avg_cpus_requested = row.cpus_requested
-        avg_percent_cpu = row.percent_cpu or 0
-        
-        if avg_cpus_requested and avg_cpus_requested > 0:
-            # Use historical average, cap at 16 for very parallel tools
-            recommended_cpus = min(16, max(1, int(round(avg_cpus_requested))))
-        elif avg_percent_cpu > 0:
-            # Estimate from percent_cpu (e.g., 800% = ~8 cores utilized)
-            # Cap at 16 for highly parallel tools
-            estimated_cpus = int(round(avg_percent_cpu / 100))
-            recommended_cpus = min(16, max(1, estimated_cpus))
+        # Use ML model's CPU prediction (P75 for efficient utilization)
+        if 'cpu' in predictions and predictions['cpu'].get('success'):
+            ml_cpu = predictions['cpu']['value']  # P75 value
+            recommended_cpus = max(1, int(ml_cpu))
+            # Cap at 16 for very parallel tools
+            recommended_cpus = min(16, recommended_cpus)
         else:
-            recommended_cpus = 1
+            # Fallback to historical average if ML prediction unavailable
+            avg_cpus_requested = row.cpus_requested
+            avg_percent_cpu = row.percent_cpu or 0
+            
+            if avg_cpus_requested and avg_cpus_requested > 0:
+                recommended_cpus = min(16, max(1, int(round(avg_cpus_requested))))
+            elif avg_percent_cpu > 0:
+                estimated_cpus = int(round(avg_percent_cpu / 100))
+                recommended_cpus = min(16, max(1, estimated_cpus))
+            else:
+                recommended_cpus = 1
         
-        # Generate Nextflow config recommendation with safe values
+        # Generate Nextflow config recommendation using resource-specific percentiles
         config_recommendation = {}
         if 'memory' in predictions:
-            config_recommendation['memory'] = format_memory(predictions['memory']['value'] * 1.5)
+            config_recommendation['memory'] = format_memory(predictions['memory']['value'])  # P95
         if 'time' in predictions:
-            config_recommendation['time'] = round_time(predictions['time']['value'])
-        config_recommendation['cpus'] = recommended_cpus
+            config_recommendation['time'] = round_time(predictions['time']['value'])  # P99 (already ≥1hr)
+        config_recommendation['cpus'] = recommended_cpus  # P75
         
         return {
             "success": True,
@@ -869,7 +1024,7 @@ def predict_resources(
             "historical_samples": int(row.sample_count),
             "predictions": predictions,
             "nextflow_config": config_recommendation,
-            "message": "Predictions based on historical data with P95 safety margin"
+            "message": "Strategy: Memory P95 (avoid OOM), Time P99+1hr min (avoid timeout), CPU P75 (70-90% utilization)"
         }
         
     except Exception as e:
@@ -997,17 +1152,17 @@ def get_optimization_recommendations(
         # Add efficiency insights
         insights = []
         
+        # CPU utilization insight removed - percent_cpu > 100% is normal for multi-threaded tools
+        # (e.g., 400% = 4 cores fully utilized, not a bottleneck)
         if recommendations['cpu_utilization']:
             avg_cpu = recommendations['cpu_utilization']['mean']
-            if avg_cpu < 50:
+            if avg_cpu < 25:
                 insights.append("Low CPU utilization - consider reducing CPU allocation")
-            elif avg_cpu > 90:
-                insights.append("High CPU utilization - process is CPU-bound")
         
         if recommendations['memory']:
             mem_recommended = recommendations['memory']['p95']
             mem_requested = np.mean([r['memory_requested'] for r in historical_data if r.get('memory_requested')])
-            if mem_recommended < mem_recommended * 0.7:
+            if mem_recommended < mem_requested * 0.7:
                 insights.append(f"Memory over-allocated - can reduce by ~{int((1 - mem_recommended/mem_requested)*100)}%")
         
         recommendations['insights'] = insights
@@ -1101,35 +1256,56 @@ def get_all_optimizations(
             mem_stats = calc_stats([r['peak_rss'] for r in historical_data])
             dur_stats = calc_stats([r['duration'] for r in historical_data])
             
-            # Calculate average CPUs from historical data
-            # Strategy: Trust explicit cpus_requested, only cap uncertain estimates
-            avg_cpus = []
-            has_explicit_cpu_data = False
-            
-            for r in historical_data:
-                if r.get('cpus_requested') and r['cpus_requested'] > 0:
-                    # Trust explicit CPU requests from workflow - no artificial cap
-                    # If user requested 16 CPUs for STAR, we honor that
-                    avg_cpus.append(r['cpus_requested'])
-                    has_explicit_cpu_data = True
-                elif r.get('percent_cpu') and r['percent_cpu'] > 0:
-                    # Estimate from percent_cpu only when explicit data unavailable
-                    # Cap at 12 for estimates (uncertain data needs conservative bound)
-                    estimated = min(12, max(1, int(round(r['percent_cpu'] / 100))))
-                    avg_cpus.append(estimated)
-            
-            # Use average - only cap if we're estimating (no explicit CPU data)
-            if avg_cpus:
-                avg_cpu_value = np.mean(avg_cpus)
+            # Use ML model's CPU prediction for consistency with /ml/predict endpoint
+            try:
+                from ml.models import ResourcePredictor
+                predictor = ResourcePredictor()
+                predictor.load_models()
                 
-                # If we have explicit CPU requests, trust them (no cap)
-                # If we're estimating from percent_cpu, cap at 12 for safety
-                if has_explicit_cpu_data:
-                    recommended_cpus = max(1, int(round(avg_cpu_value)))
+                # Build feature vector (same as /ml/predict)
+                features = {
+                    'cpus_requested': np.mean([r['cpus_requested'] for r in historical_data if r.get('cpus_requested')]) or 0,
+                    'time_requested': np.mean([r['time_requested'] for r in historical_data if r.get('time_requested')]) or 0,
+                    'storage_requested': 0,
+                    'memory_requested': np.mean([r['memory_requested'] for r in historical_data if r.get('memory_requested')]) or 0,
+                    'realtime': np.mean([r['duration'] for r in historical_data if r.get('duration')]) or 0,
+                    'percent_cpu': np.mean([r['percent_cpu'] for r in historical_data if r.get('percent_cpu')]) or 0,
+                    'percent_memory': np.mean([r['percent_memory'] for r in historical_data if r.get('percent_memory')]) or 0,
+                    'peak_rss': np.mean([r['peak_rss'] for r in historical_data if r.get('peak_rss')]) or 0,
+                    'peak_vmem': np.mean([r['peak_vmem'] for r in historical_data if r.get('peak_vmem')]) or 0,
+                    'read_char': 0,
+                    'write_char': 0,
+                    'duration': np.mean([r['duration'] for r in historical_data if r.get('duration')]) or 0,
+                    'energy_consumption_mwh': np.mean([r['energy_consumption_mwh'] for r in historical_data if r.get('energy_consumption_mwh')]) or 0,
+                    'co2e_mg': np.mean([r['co2e_mg'] for r in historical_data if r.get('co2e_mg')]) or 0,
+                    'powerdraw_cpu_w': 0,
+                    'has_module': 1 if ':' in module_name else 0,
+                    'cpu_utilization': (np.mean([r['percent_cpu'] for r in historical_data if r.get('percent_cpu')]) or 0) / 100.0,
+                    'memory_utilization': (np.mean([r['percent_memory'] for r in historical_data if r.get('percent_memory')]) or 0) / 100.0,
+                    'memory_requested_mb': np.mean([r['memory_requested'] for r in historical_data if r.get('memory_requested')]) or 0,
+                    'memory_efficiency': 1.0,
+                    'time_efficiency': 1.0,
+                    'io_total': 0,
+                    'io_ratio': 0,
+                    'cpu_mem_product': 0,
+                    'energy_per_sec': 0,
+                    'co2_per_mb': 0,
+                    'process_base': module_name.split('_')[-1] if '_' in module_name else module_name,
+                    'institute_encoded': 0,
+                    'cpu_encoded': 0,
+                }
+                
+                # Get ML prediction for CPU
+                cpu_result = predictor.predict(features, 'cpu')
+                if cpu_result.get('success'):
+                    recommended_cpus = max(1, int(round(cpu_result['prediction_p95'])))
+                    recommended_cpus = min(16, recommended_cpus)  # Cap at 16
                 else:
-                    recommended_cpus = min(12, max(1, int(round(avg_cpu_value))))
-            else:
-                recommended_cpus = 1
+                    recommended_cpus = 1
+            except Exception:
+                # Fallback to simple average if ML unavailable
+                avg_cpus = [r['cpus_requested'] for r in historical_data if r.get('cpus_requested')]
+                recommended_cpus = max(1, int(round(np.mean(avg_cpus)))) if avg_cpus else 1
             
             optimization = {
                 "module_name": module_name,
@@ -1146,10 +1322,9 @@ def get_all_optimizations(
             
             # Add insights
             insights = []
-            if optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] < 50:
+            # CPU utilization insight removed - percent_cpu > 100% is normal for multi-threaded tools
+            if optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] < 25:
                 insights.append("Low CPU utilization - consider reducing CPU allocation")
-            elif optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] > 90:
-                insights.append("High CPU utilization - process is CPU-bound")
             
             optimization['insights'] = insights
             all_optimizations.append(optimization)

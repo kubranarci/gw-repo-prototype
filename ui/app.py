@@ -399,26 +399,33 @@ def render_ml_predictions():
                 with col_mem:
                     mem_pred = predictions.get('memory', {})
                     st.metric(
-                        "Memory",
+                        "Memory (P95)",
                         f"{mem_pred.get('value', 0):.1f} {mem_pred.get('unit', 'MB')}",
-                        delta=f"P95 margin: {mem_pred.get('safety_margin', 1)}x"
+                        delta=f"Mean: {mem_pred.get('value_mean', 0):.1f} MB"
                     )
+                    st.caption(f"Strategy: Avoid OOM kills")
                 
                 with col_time:
                     time_pred = predictions.get('time', {})
+                    p95_val = time_pred.get('p95', 0)
+                    p99_val = time_pred.get('p99', 0)
+                    time_min = time_pred.get('time_minimum', 3600)
+                    
                     st.metric(
-                        "Time",
-                        f"{time_pred.get('value', 0):.1f} {time_pred.get('unit', 'seconds')}",
-                        delta=f"P95 margin: {time_pred.get('safety_margin', 1)}x"
+                        "Time (P99)",
+                        f"{p99_val:.1f} {time_pred.get('unit', 'seconds')}",
+                        delta=f"P95: {p95_val:.1f}s, Min: {time_min/60:.0f}m"
                     )
+                    st.caption(f"Strategy: Avoid timeout (P99 + min 1h)")
                 
                 with col_cpu:
                     cpu_pred = predictions.get('cpu', {})
                     st.metric(
-                        "CPU",
+                        "CPU (P75)",
                         f"{int(cpu_pred.get('value', 1))} {cpu_pred.get('unit', 'cores')}",
-                        delta=f"P95 margin: {cpu_pred.get('safety_margin', 1)}x"
+                        delta=f"Mean: {int(cpu_pred.get('value_mean', 1))} cores"
                     )
+                    st.caption(f"Strategy: 70-90% per-core utilization")
                 
                 st.subheader("Nextflow Config")
                 nextflow_config = result.get('nextflow_config', {})

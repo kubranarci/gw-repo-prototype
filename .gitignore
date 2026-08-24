@@ -1,8 +1,9 @@
 # Streamlit agent skills (environment-specific symlinks)
 .agents/skills/developing-with-streamlit/*
 .agents/skills/*
-.agents/*
+.agents*
 client/.env
 api/.env
 db/.env
 .env
+models*

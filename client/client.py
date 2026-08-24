@@ -567,7 +567,8 @@ def find_and_group_runs(pipeline_info_dir: Path) -> Dict[str, Dict]:
 def submit_directory(
     pipeline_info_dir: Path = typer.Argument(..., help="Path to the pipeline_info directory containing trace and bco files"),
     work_dir: Optional[Path] = typer.Option(None, help="Path to the work directory for disk usage scanning"),
-    api_key: str = typer.Option(None, help="API key for authentication")
+    api_key: str = typer.Option(None, help="API key for authentication"),
+    retrain: bool = typer.Option(False, "--retrain", help="Trigger manual model retraining after submission")
 ):
     """
     Submit pipeline execution data to the API.
@@ -813,6 +814,28 @@ def submit_directory(
         has_bco = "✓" if bco_file else "✗"
         has_co2 = "✓" if co2_trace else "✗"
         typer.echo(f"  Summary: BCO={has_bco}, CO2={has_co2}, Processes={len(process_execution_data)}")
+    
+    # Trigger manual retraining if requested
+    if retrain:
+        typer.echo("\n🔄 Triggering manual model retraining...")
+        response = requests.post(
+            f"{API_BASE_URL}/ml/retrain",
+            json={"prioritize_failures": True},
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            typer.echo(f"  ✓ Retraining complete!")
+            typer.echo(f"    - Training samples: {result.get('training_samples', 0)}")
+            typer.echo(f"    - Failure samples: {result.get('failure_samples', 0)}")
+            typer.echo(f"    - Prioritized failures: {result.get('prioritized_failures', False)}")
+            
+            # Show failure notification if failures were found
+            if result.get('failure_samples', 0) > 0:
+                typer.echo(f"\n⚠️  {result['failure_samples']} failure data points detected - models weighted 2x higher for these samples")
+        else:
+            typer.echo(f"  ✗ Retraining failed: {response.text}", err=True)
 
 if __name__ == "__main__":
     app()
