@@ -567,7 +567,9 @@ def find_and_group_runs(pipeline_info_dir: Path) -> Dict[str, Dict]:
 def submit_directory(
     pipeline_info_dir: Path = typer.Argument(..., help="Path to the pipeline_info directory containing trace and bco files"),
     work_dir: Optional[Path] = typer.Option(None, help="Path to the work directory for disk usage scanning"),
-    api_key: str = typer.Option(None, help="API key for authentication")
+    api_key: str = typer.Option(None, help="API key for authentication"),
+    data_size: str = typer.Option("mixed", help="Data size category: small, medium, large, mixed"),
+    retrain: bool = typer.Option(False, "--retrain", help="Trigger manual model retraining after submission")
 ):
     """
     Submit pipeline execution data to the API.
@@ -627,8 +629,9 @@ def submit_directory(
                 "institute_id": INSTITUTE_ID,
             }
         
-        # Always include institute_id
+        # Always include institute_id and data_size_tag
         workflow_execution_data["institute_id"] = INSTITUTE_ID
+        workflow_execution_data["data_size_tag"] = data_size
         
         # Submit workflow
         response = requests.post(f"{API_BASE_URL}/workflows/", json=workflow_execution_data, headers=headers)
@@ -813,6 +816,25 @@ def submit_directory(
         has_bco = "✓" if bco_file else "✗"
         has_co2 = "✓" if co2_trace else "✗"
         typer.echo(f"  Summary: BCO={has_bco}, CO2={has_co2}, Processes={len(process_execution_data)}")
+    
+    # Trigger manual retraining if requested
+    if retrain:
+        typer.echo("\n🔄 Triggering manual model retraining...")
+        response = requests.post(
+            f"{API_BASE_URL}/ml/retrain",
+            json={"prioritize_failures": True},
+            headers=headers
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            typer.echo(f"  ✓ Retraining complete!")
+            typer.echo(f"    - Training samples: {result.get('training_samples', 0)}")
+            if result.get('training_stats'):
+                stats = result['training_stats']
+                typer.echo(f"    - Disk range: {stats.get('disk_mb_min', 0):.2f} - {stats.get('disk_mb_max', 0):.2f} MB")
+        else:
+            typer.echo(f"  ✗ Retraining failed: {response.text}", err=True)
 
 if __name__ == "__main__":
     app()

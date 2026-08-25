@@ -21,33 +21,88 @@ with st.sidebar:
     st.subheader("Navigation")
     page = st.radio(
         "Go to",
-        ["Dashboard", "ML Training", "ML Predictions", "Optimization", "Model Performance"],
+        ["Dashboard", "ML Training", "Optimizations", "Model Performance"],
         label_visibility="collapsed"
     )
 
 def render_resource_charts(df: pd.DataFrame):
-    # Show data table FIRST - with ALL columns for debugging
-    st.subheader("Detailed Process Data Table")
+    st.title("📊 Dashboard - Real Workflow Metrics")
+    st.write("View **actual historical execution data** from your submitted workflows.")
+    
+    # ============================================
+    # DETAILED DATA TABLE - ALL RUNS (TOP - FIRST THING USER SEES)
+    # ============================================
     if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
-        # Create a copy and sanitize process_name to remove sample names
+        # Sanitize process names
         display_df = df.copy()
-        
-        # PRIVACY FIX: Remove sample names from process_name
-        # "NFCORE:...:BCFTOOLS_REHEADER (test6)" → "BCFTOOLS_REHEADER"
         if 'process_name' in display_df.columns:
             display_df['process_name'] = display_df['process_name'].apply(
                 lambda x: re.sub(r'\s*\(.*\)', '', str(x)) if isinstance(x, str) else str(x)
             )
         
-        # Show ALL columns for debugging
-        st.dataframe(display_df, use_container_width=True)
+        # Select and order columns for display
+        display_columns = [
+            'process_name', 'workflow_name', 'institute_id', 'duration',
+            'peak_rss', 'peak_vmem', 'percent_cpu', 'cpus_requested',
+            'memory_requested', 'time_requested', 'disk_usage_mb',
+            'read_bytes', 'write_bytes', 'start_time'
+        ]
+        available_columns = [col for col in display_columns if col in display_df.columns]
+        
+        st.subheader("📋 Detailed Execution Data (All Runs)")
+        st.dataframe(
+            display_df[available_columns],
+            use_container_width=True,
+            height=500
+        )
+        st.info(f"Total runs: {len(display_df)}")
     else:
-        st.info("No data available")
+        st.info("No detailed data available")
     
     st.divider()
     
-    # Then show visualizations
-    st.subheader("Process Resource Visualizations")
+    # ============================================
+    # SUMMARY STATISTICS
+    # ============================================
+    st.subheader("📈 Summary Statistics by Process")
+    
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        display_df = df.copy()
+        if 'process_name' in display_df.columns:
+            display_df['process_name'] = display_df['process_name'].apply(
+                lambda x: re.sub(r'\s*\(.*\)', '', str(x)) if isinstance(x, str) else str(x)
+            )
+        
+        display_df['short_name'] = display_df['process_name'].apply(
+            lambda x: x.split(':')[-1] if isinstance(x, str) else str(x)
+        )
+        
+        numeric_metrics = {
+            'duration': ('Duration', 's'),
+            'peak_rss': ('Memory Used', 'MB'),
+            'percent_cpu': ('CPU Utilization', '%'),
+            'disk_usage_mb': ('Disk Usage', 'MB'),
+            'cpus_requested': ('CPUs Requested', 'cores'),
+            'memory_requested': ('Memory Requested', 'MB'),
+            'time_requested': ('Time Requested', 's')
+        }
+        
+        for metric, (label, unit) in numeric_metrics.items():
+            if metric in display_df.columns and not display_df[metric].isna().all():
+                with st.expander(f"{label} ({unit})"):
+                    stats_df = display_df.groupby('short_name')[metric].agg([
+                        'count', 'mean', 'std', 'min', 'median', 'max'
+                    ]).round(2)
+                    stats_df.columns = ['Runs', 'Average', 'Std Dev', 'Min', 'Median', 'Max']
+                    stats_df = stats_df.sort_values('Average', ascending=False)
+                    st.dataframe(stats_df, use_container_width=True)
+    
+    st.divider()
+    
+    # ============================================
+    # VISUALIZATIONS
+    # ============================================
+    st.subheader("📉 Process Resource Visualizations")
     
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         st.warning("No data found to display.")
@@ -218,8 +273,13 @@ def fetch_process_data(api_key_val):
         return pd.DataFrame()
 
 def render_ml_training():
-    st.title("ML Model Training")
-    st.write("Train machine learning models to predict resource requirements for Nextflow processes.")
+    st.title("🤖 ML Training - Build Prediction Models")
+    st.write("""
+    **Step 2: Train ML Models**
+    
+    After reviewing your historical data in the Dashboard, train ML models to learn resource usage patterns. 
+    These models will enable predictions for small, medium, and large dataset scenarios.
+    """)
     
     if not API_KEY:
         st.warning("Please enter your API key in the sidebar to authenticate.")
@@ -254,51 +314,31 @@ def render_ml_training():
                     st.error(f"Connection failed: {e}")
     
     with col2:
-        st.subheader("Training Status")
+        st.subheader("Training Results")
         if 'training_result' in st.session_state:
             result = st.session_state['training_result']
             
             if result.get('success'):
                 st.metric("Training Samples", result.get('training_samples', 0))
-                st.metric("Models Trained", result.get('message', '').split(' ')[1])
                 
-                st.subheader("Model Results")
                 model_results = result.get('model_results', {})
                 
-                for model_type, metrics in model_results.items():
-                    if metrics.get('success'):
-                        with st.expander(f"{model_type.title()} Model - R²: {metrics.get('test_r2', 0):.3f}"):
-                            st.write(f"**Training Samples:** {metrics.get('training_samples', 0)}")
-                            st.write(f"**Test Samples:** {metrics.get('test_samples', 0)}")
-                            st.write(f"**Test R²:** {metrics.get('test_r2', 0):.4f}")
-                            st.write(f"**Test RMSE:** {metrics.get('test_rmse', 0):.4f}")
-                            st.write(f"**Test MAE:** {metrics.get('test_mae', 0):.4f}")
-                            st.write(f"**CV R² Mean:** {metrics.get('cv_r2_mean', 0):.4f}")
-                            
-                            if metrics.get('feature_importance'):
-                                fi = metrics['feature_importance']
-                                fi_sorted = dict(sorted(fi.items(), key=lambda x: x[1], reverse=True)[:10])
-                                fi_df = pd.DataFrame({
-                                    'Feature': list(fi_sorted.keys()),
-                                    'Importance': list(fi_sorted.values())
-                                })
-                                fig = px.bar(fi_df, x='Importance', y='Feature', orientation='h',
-                                           title=f"Top 10 Features - {model_type.title()}")
-                                st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.error(f"{model_type.title()} Model: {metrics.get('error', 'Failed')}")
+                if model_results:
+                    for model_type, metrics in model_results.items():
+                        if isinstance(metrics, dict):
+                            r2 = metrics.get('test_r2', 0)
+                            rmse = metrics.get('test_rmse', 0)
+                            st.write(f"**{model_type.title()} Model**")
+                            st.write(f"  - Test R²: {r2:.4f}")
+                            st.write(f"  - Test RMSE: {rmse:.4f}")
+                            st.write(f"  - CV R²: {metrics.get('cv_r2_mean', 0):.4f}")
                 
-                st.subheader("Feature Statistics")
                 stats = result.get('feature_statistics', {})
-                for metric, values in stats.items():
-                    if isinstance(values, dict) and 'mean' in values:
-                        with st.expander(f"{metric.replace('_', ' ').title()}"):
-                            st.write(f"Mean: {values.get('mean', 0):.2f}")
-                            st.write(f"Std: {values.get('std', 0):.2f}")
-                            st.write(f"Min: {values.get('min', 0):.2f}")
-                            st.write(f"Max: {values.get('max', 0):.2f}")
-                            st.write(f"Median: {values.get('median', 0):.2f}")
-                            st.write(f"P95: {values.get('p95', 0):.2f}")
+                if stats:
+                    st.write("**Feature Statistics:**")
+                    for metric, values in list(stats.items())[:3]:
+                        if isinstance(values, dict) and 'mean' in values:
+                            st.write(f"- {metric}: mean={values.get('mean', 0):.1f}, range=[{values.get('min', 0):.1f}, {values.get('max', 0):.1f}]")
             else:
                 st.error(f"Training failed: {result.get('error', 'Unknown error')}")
         else:
@@ -325,129 +365,9 @@ def fetch_processes(api_key_val, institute_id=None):
         return []
 
 
-def render_ml_predictions():
-    st.title("ML Resource Predictions")
-    st.write("Get ML-based predictions for resource requirements of Nextflow processes.")
-    
-    if not API_KEY:
-        st.warning("Please enter your API key in the sidebar to authenticate.")
-        return
-    
-    # Fetch available processes
-    processes = fetch_processes(API_KEY)
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.subheader("Prediction Request")
-        
-        # Cache clear button
-        if st.button("Refresh Module List", key="refresh_processes"):
-            fetch_processes.clear()
-            st.rerun()
-        
-        if processes:
-            # Create a searchable selectbox
-            process_name = st.selectbox(
-                "Select Module",
-                options=processes,
-                placeholder="Choose a module...",
-                help="Select from modules with historical execution data"
-            )
-        else:
-            process_name = st.text_input("Process Name", placeholder="e.g., BCFTOOLS_SORT")
-        
-        if st.button("Get Prediction", type="primary", use_container_width=True):
-            if not process_name:
-                st.error("Please select or enter a process name")
-            else:
-                with st.spinner("Getting predictions..."):
-                    headers = {
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json"
-                    }
-                    try:
-                        response = requests.get(
-                            f"{API_BASE_URL}/ml/predict?process_name={process_name}",
-                            headers=headers
-                        )
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            st.session_state['prediction_result'] = result
-                            if result.get('success'):
-                                st.success(f"Predictions for {result.get('module_name', 'module')}")
-                            else:
-                                st.error(result.get('message', 'Prediction failed'))
-                        else:
-                            st.error(f"Prediction failed: {response.text}")
-                    except Exception as e:
-                        st.error(f"Connection failed: {e}")
-    
-    with col2:
-        st.subheader("Prediction Results")
-        if 'prediction_result' in st.session_state:
-            result = st.session_state['prediction_result']
-            
-            if result.get('success'):
-                st.metric("Module", result.get('module_name', 'N/A'))
-                
-                predictions = result.get('predictions', {})
-                
-                col_mem, col_time, col_cpu = st.columns(3)
-                
-                with col_mem:
-                    mem_pred = predictions.get('memory', {})
-                    st.metric(
-                        "Memory",
-                        f"{mem_pred.get('value', 0):.1f} {mem_pred.get('unit', 'MB')}",
-                        delta=f"P95 margin: {mem_pred.get('safety_margin', 1)}x"
-                    )
-                
-                with col_time:
-                    time_pred = predictions.get('time', {})
-                    st.metric(
-                        "Time",
-                        f"{time_pred.get('value', 0):.1f} {time_pred.get('unit', 'seconds')}",
-                        delta=f"P95 margin: {time_pred.get('safety_margin', 1)}x"
-                    )
-                
-                with col_cpu:
-                    cpu_pred = predictions.get('cpu', {})
-                    st.metric(
-                        "CPU",
-                        f"{int(cpu_pred.get('value', 1))} {cpu_pred.get('unit', 'cores')}",
-                        delta=f"P95 margin: {cpu_pred.get('safety_margin', 1)}x"
-                    )
-                
-                st.subheader("Nextflow Config")
-                nextflow_config = result.get('nextflow_config', {})
-                module_name = result.get('module_name', 'module')
-                config_text = f"""process {{
-    withName: '{module_name}' {{
-        cpus = {nextflow_config.get('cpus', 1)}
-        memory = '{nextflow_config.get('memory', '100 MB')}'
-        time = '{nextflow_config.get('time', '1h')}'
-    }}
-}}"""
-                st.code(config_text, language="groovy")
-                
-                st.download_button(
-                    label="Download Config Snippet",
-                    data=config_text,
-                    file_name=f"{module_name}.config",
-                    mime="text/plain"
-                )
-                
-                st.info(result.get('message', ''))
-            else:
-                st.error(f"Prediction failed: {result.get('message', 'Unknown error')}")
-        else:
-            st.info("No predictions yet. Enter a process name and click 'Get Prediction'.")
-
-@st.cache_data
+@st.cache_data(ttl=300)
 def fetch_all_optimizations(api_key_val, institute_id=None):
-    """Fetch all optimization recommendations from the API."""
+    """Fetch all optimization recommendations for ALL processes with S/M/L scenarios."""
     headers = {
         "Authorization": f"Bearer {api_key_val}",
         "Content-Type": "application/json"
@@ -456,7 +376,7 @@ def fetch_all_optimizations(api_key_val, institute_id=None):
         url = f"{API_BASE_URL}/ml/optimizations"
         if institute_id:
             url += f"?institute_id={institute_id}"
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=60)
         if response.status_code == 200:
             return response.json()
         else:
@@ -465,189 +385,192 @@ def fetch_all_optimizations(api_key_val, institute_id=None):
         return None
 
 
-def render_optimization():
-    st.title("Process Optimization Recommendations")
-    st.write("Get data-driven optimization recommendations for Nextflow processes based on historical execution data.")
+def render_optimizations():
+    st.title("⚡ Resource Optimizations - ML-Based Configurations")
+    st.write("""
+    **Get optimized configurations for individual processes OR download all**
+    
+    ML models predict resources for small, medium, and large dataset sizes.
+    Select a process from dropdown to view predictions, or download all configs.
+    """)
     
     if not API_KEY:
         st.warning("Please enter your API key in the sidebar to authenticate.")
         return
     
-    # Fetch available processes
-    processes = fetch_processes(API_KEY)
+    # Fetch all optimizations
+    with st.spinner("Loading ML predictions for all processes..."):
+        all_opts = fetch_all_optimizations(API_KEY)
     
-    col1, col2 = st.columns([1, 2])
+    if not all_opts or not all_opts.get('success'):
+        st.error("Failed to fetch optimizations. Train models first on ML Training tab.")
+        return
+    
+    optimizations = all_opts.get('optimizations', [])
+    
+    if not optimizations:
+        st.info("No optimizations available. Submit workflow data and train models.")
+        return
+    
+    # ============================================
+    # DROPDOWN TO SELECT PROCESS
+    # ============================================
+    st.subheader("🔍 Select Process to View Predictions")
+    
+    process_names = [opt.get('module_name', 'unknown') for opt in optimizations]
+    selected_process = st.selectbox("Choose a process:", options=process_names)
+    
+    if selected_process:
+        selected_opt = next((opt for opt in optimizations if opt.get('module_name') == selected_process), None)
+        
+        if selected_opt:
+            scenarios = selected_opt.get('scenarios', {})
+            samples = selected_opt.get('historical_samples', 0)
+            
+            st.write(f"**Historical Runs:** {samples}")
+            
+            col_s, col_m, col_l = st.columns(3)
+            
+            size_names = ['SMALL', 'MEDIUM', 'LARGE']
+            for i, size_name in enumerate(size_names):
+                cfg = scenarios.get(size_name, {})
+                with [col_s, col_m, col_l][i]:
+                    st.write(f"**{size_name} Dataset**")
+                    st.write(f"Data Size: ~{cfg.get('disk_size_mb', 0):.1f} MB")
+                    st.write(f"**CPUs:** {cfg.get('cpus', 1)}")
+                    st.write(f"**Memory:** {cfg.get('memory', 'N/A')}")
+                    st.write(f"**Time:** {cfg.get('time', 'N/A')}")
+    
+    st.divider()
+    
+    # ============================================
+    # DOWNLOAD 3 CONFIG FILES (ONE PER SIZE)
+    # ============================================
+    st.subheader("📥 Download All Configurations")
+    
+    import io
+    
+    # Generate SMALL.config (all processes)
+    small_lines = ["// Auto-generated Nextflow configuration", "// SMALL dataset scenario", f"// {len(optimizations)} processes", "process {"]
+    for opt in optimizations:
+        module = opt.get('module_name', 'unknown')
+        scenarios = opt.get('scenarios', {})
+        small_cfg = scenarios.get('SMALL', {})
+        small_lines.append(f"    withName: '{module}' {{")
+        small_lines.append(f"        cpus = {small_cfg.get('cpus', 1)}")
+        small_lines.append(f"        memory = '{small_cfg.get('memory', '256 MB')}'")
+        small_lines.append(f"        time = '{small_cfg.get('time', '1h')}'")
+        small_lines.append("    }")
+    small_lines.append("}")
+    small_config = "\n".join(small_lines)
+    
+    # Generate MEDIUM.config (all processes)
+    medium_lines = ["// Auto-generated Nextflow configuration", "// MEDIUM dataset scenario", f"// {len(optimizations)} processes", "process {"]
+    for opt in optimizations:
+        module = opt.get('module_name', 'unknown')
+        scenarios = opt.get('scenarios', {})
+        medium_cfg = scenarios.get('MEDIUM', {})
+        medium_lines.append(f"    withName: '{module}' {{")
+        medium_lines.append(f"        cpus = {medium_cfg.get('cpus', 1)}")
+        medium_lines.append(f"        memory = '{medium_cfg.get('memory', '256 MB')}'")
+        medium_lines.append(f"        time = '{medium_cfg.get('time', '1h')}'")
+        medium_lines.append("    }")
+    medium_lines.append("}")
+    medium_config = "\n".join(medium_lines)
+    
+    # Generate LARGE.config (all processes)
+    large_lines = ["// Auto-generated Nextflow configuration", "// LARGE dataset scenario", f"// {len(optimizations)} processes", "process {"]
+    for opt in optimizations:
+        module = opt.get('module_name', 'unknown')
+        scenarios = opt.get('scenarios', {})
+        large_cfg = scenarios.get('LARGE', {})
+        large_lines.append(f"    withName: '{module}' {{")
+        large_lines.append(f"        cpus = {large_cfg.get('cpus', 1)}")
+        large_lines.append(f"        memory = '{large_cfg.get('memory', '256 MB')}'")
+        large_lines.append(f"        time = '{large_cfg.get('time', '1h')}'")
+        large_lines.append("    }")
+    large_lines.append("}")
+    large_config = "\n".join(large_lines)
+    
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.subheader("Optimization Request")
-        
-        # Cache clear button
-        if st.button("Refresh Module List", key="refresh_opt_processes"):
-            fetch_processes.clear()
-            st.rerun()
-        
-        # Download all optimizations button
-        if st.button("Download All Optimizations", use_container_width=True):
-            with st.spinner("Fetching all optimizations..."):
-                all_opts = fetch_all_optimizations(API_KEY)
-                if all_opts and all_opts.get('success'):
-                    # Generate config file content
-                    config_lines = ["// Auto-generated Nextflow configuration", "// Generated by GW-Repo ML Optimization", "process {"]
-                    for opt in all_opts.get('optimizations', []):
-                        module = opt.get('module_name', 'unknown')
-                        rec = opt.get('recommended_config', {})
-                        config_lines.append(f"    withName: '{module}' {{")
-                        config_lines.append(f"        memory = '{rec.get('memory', '1 GB')}'")
-                        config_lines.append(f"        time = '{rec.get('time', '1h')}'")
-                        config_lines.append(f"        cpus = {rec.get('cpus', 1)}")
-                        config_lines.append("    }")
-                    config_lines.append("}")
-                    
-                    config_content = "\n".join(config_lines)
-                    st.download_button(
-                        label="Download nextflow_optimized.config",
-                        data=config_content,
-                        file_name="nextflow_optimized.config",
-                        mime="text/plain",
-                        key="download_all_config"
-                    )
-                    
-                    # Also show as JSON
-                    json_content = json.dumps(all_opts.get('optimizations', []), indent=2)
-                    st.download_button(
-                        label="Download optimizations.json",
-                        data=json_content,
-                        file_name="optimizations.json",
-                        mime="application/json",
-                        key="download_all_json"
-                    )
-                    
-                    st.success(f"Fetched optimizations for {all_opts.get('modules', 0)} modules")
-                else:
-                    st.error("Failed to fetch optimizations")
-        
-        st.divider()
-        
-        if processes:
-            process_name = st.selectbox(
-                "Select Module",
-                options=processes,
-                placeholder="Choose a module...",
-                help="Select from modules with historical execution data"
-            )
-        else:
-            process_name = st.text_input("Process Name", placeholder="e.g., BCFTOOLS_SORT")
-        
-        institute_id = st.text_input("Institute ID (optional)", value="DKFZ")
-        
-        if st.button("Get Recommendations", type="primary", use_container_width=True):
-            if not process_name:
-                st.error("Please select or enter a module name")
-            else:
-                with st.spinner("Analyzing historical data..."):
-                    headers = {
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json"
-                    }
-                    try:
-                        response = requests.get(
-                            f"{API_BASE_URL}/ml/optimization/{process_name}?institute_id={institute_id if institute_id else ''}",
-                            headers=headers
-                        )
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            st.session_state['optimization_result'] = result
-                            if result.get('success'):
-                                st.success(f"Recommendations for {result.get('module_name', result.get('process_name', 'module'))}")
-                            else:
-                                st.error(result.get('message', 'Optimization failed'))
-                        else:
-                            st.error(f"Optimization failed: {response.text}")
-                    except Exception as e:
-                        st.error(f"Connection failed: {e}")
+        st.download_button(
+            label="⬇️ SMALL.config",
+            data=small_config,
+            file_name="small.config",
+            mime="text/plain",
+            use_container_width=True
+        )
     
     with col2:
-        st.subheader("Optimization Results")
-        if 'optimization_result' in st.session_state:
-            result = st.session_state['optimization_result']
-            
-            if result.get('success'):
-                st.metric("Module", result.get('module_name', result.get('process_name', 'N/A')))
-                st.metric("Historical Samples", result.get('historical_samples', 0))
-                
-                st.subheader("Resource Statistics")
-                
-                col1_stats, col2_stats = st.columns(2)
-                
-                with col1_stats:
-                    if result.get('memory'):
-                        mem = result['memory']
-                        st.metric("Memory (mean)", f"{mem.get('mean', 0):.1f} MB")
-                        st.metric("Memory (P95)", f"{mem.get('p95', 0):.1f} MB")
-                        st.metric("Memory (max)", f"{mem.get('max', 0):.1f} MB")
-                    
-                    if result.get('duration'):
-                        dur = result['duration']
-                        st.metric("Duration (mean)", f"{dur.get('mean', 0):.2f} s")
-                        st.metric("Duration (P95)", f"{dur.get('p95', 0):.2f} s")
-                        st.metric("Duration (max)", f"{dur.get('max', 0):.2f} s")
-                
-                with col2_stats:
-                    if result.get('cpu_utilization'):
-                        cpu = result['cpu_utilization']
-                        st.metric("CPU Util (mean)", f"{cpu.get('mean', 0):.1f}%")
-                        st.metric("CPU Util (max)", f"{cpu.get('max', 0):.1f}%")
-                    
-                    if result.get('energy'):
-                        energy = result['energy']
-                        st.metric("Energy (mean)", f"{energy.get('mean', 0):.2f} mWh")
-                        st.metric("Energy (max)", f"{energy.get('max', 0):.2f} mWh")
-                    
-                    if result.get('co2'):
-                        co2 = result['co2']
-                        st.metric("CO2 (mean)", f"{co2.get('mean', 0):.2f} mg")
-                        st.metric("CO2 (max)", f"{co2.get('max', 0):.2f} mg")
-                
-                st.subheader("Recommended Configuration")
-                rec_config = result.get('recommended_config', {})
-                module_name = result.get('module_name', result.get('process_name', ''))
-                st.code(f"""process {{
-    withName: '{module_name}' {{
-        memory = '{rec_config.get('memory', '1 GB')}'
-        time = '{rec_config.get('time', '1h')}'
-        cpus = {rec_config.get('cpus', 1)}
-    }}
-}}""", language="groovy")
-                
-                # Download single module config
-                single_config = f"""process {{
-    withName: '{module_name}' {{
-        memory = '{rec_config.get('memory', '1 GB')}'
-        time = '{rec_config.get('time', '1h')}'
-        cpus = {rec_config.get('cpus', 1)}
-    }}
-}}"""
-                st.download_button(
-                    label=f"Download {module_name}.config",
-                    data=single_config,
-                    file_name=f"{module_name}.config",
-                    mime="text/plain",
-                    key=f"download_{module_name}"
-                )
-                
-                if result.get('insights'):
-                    st.subheader("Insights")
-                    for insight in result['insights']:
-                        st.info(insight)
-            else:
-                st.error(f"Optimization failed: {result.get('message', 'Unknown error')}")
-        else:
-            st.info("No recommendations yet. Enter a process name and click 'Get Recommendations'.")
+        st.download_button(
+            label="⬇️ MEDIUM.config",
+            data=medium_config,
+            file_name="medium.config",
+            mime="text/plain",
+            use_container_width=True
+        )
+    
+    with col3:
+        st.download_button(
+            label="⬇️ LARGE.config",
+            data=large_config,
+            file_name="large.config",
+            mime="text/plain",
+            use_container_width=True
+        )
+    
+    st.info(f"Each file contains ALL {len(optimizations)} processes for that dataset size.")
+
 
 def render_model_performance():
-    st.title("Model Performance Dashboard")
-    st.write("Monitor the performance and accuracy of trained ML models.")
+    st.title("📈 Model Performance - Understanding the Metrics")
+    st.write("""
+    **Monitor ML model accuracy and understand what the metrics mean**
+    
+    These metrics tell you how well the trained models can predict resource requirements.
+    """)
+    
+    # Add explanations
+    with st.expander("📖 How to Interpret These Metrics"):
+        st.write("""
+        ### R² (R-Squared / Coefficient of Determination)
+        - **What it measures**: How well the model's predictions match actual values
+        - **Range**: 0 to 1 (or 0% to 100%)
+        - **Interpretation**:
+          - **R² > 0.9**: Excellent fit - model explains 90%+ of variance ✅
+          - **R² 0.7-0.9**: Good fit - model explains 70-90% of variance 👍
+          - **R² 0.5-0.7**: Moderate fit - predictions may be less reliable ⚠️
+          - **R² < 0.5**: Poor fit - model needs more training data ❌
+        - **Example**: R² = 0.95 means the model explains 95% of the variation in resource usage
+        
+        ### RMSE (Root Mean Square Error)
+        - **What it measures**: Average prediction error (in the same units as the target)
+        - **Interpretation**: Lower is better
+        - **Example**: RMSE = 100 MB for memory means predictions are off by ~100 MB on average
+        
+        ### MAE (Mean Absolute Error)
+        - **What it measures**: Average absolute prediction error
+        - **Interpretation**: Lower is better, less sensitive to outliers than RMSE
+        - **Example**: MAE = 50 seconds means predictions are off by ~50 seconds on average
+        
+        ### CV R² Mean (Cross-Validation R²)
+        - **What it measures**: Model performance on unseen data (more reliable than test R²)
+        - **Interpretation**: Should be close to test R². Large gap indicates overfitting.
+        - **Example**: CV R² = 0.92 means the model generalizes well to new data
+        
+        ### Feature Importance
+        - **What it measures**: Which input features most influence predictions
+        - **Interpretation**: Higher = more important
+        - **Example**: If 'disk_usage_mb' has highest importance, data size is the main driver of resource usage
+        
+        ### When to Retrain Models
+        - R² drops below 0.7
+        - You've submitted many new workflows
+        - Predictions consistently differ from actual usage
+        - New processes are added that weren't in training data
+        """)
     
     if not API_KEY:
         st.warning("Please enter your API key in the sidebar to authenticate.")
@@ -671,24 +594,40 @@ def render_model_performance():
             st.subheader("Trained Models Overview")
             
             for model in models:
-                model_type = model.get('model_type', 'unknown')
                 model_name = model.get('model_name', 'unknown')
+                model_type = model.get('target_process', model.get('model_type', 'unknown'))
                 accuracy = json.loads(model.get('accuracy_metrics', '{}'))
                 
-                with st.expander(f"{model_type.title()} Model ({model_name}) - Trained: {model.get('trained_at', 'N/A')}"):
+                # Extract resource type from model name (e.g., "resource_memory_predictor" -> "MEMORY")
+                if 'memory' in model_name.lower():
+                    resource_type = 'MEMORY'
+                elif 'time' in model_name.lower():
+                    resource_type = 'TIME'
+                elif 'cpu' in model_name.lower():
+                    resource_type = 'CPU'
+                else:
+                    resource_type = model_type.upper() if model_type else 'RESOURCE'
+                
+                r2 = accuracy.get('test_r2', 0)
+                rmse = accuracy.get('test_rmse', 0)
+                mae = accuracy.get('test_mae', 0)
+                cv_r2 = accuracy.get('cv_r2_mean', 0)
+                samples = model.get('training_samples', 0)
+                
+                with st.expander(f"{resource_type} Prediction Model - Test R²: {r2:.4f}"):
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        st.metric("Test R²", f"{accuracy.get('test_r2', 0):.4f}")
-                        st.metric("Test RMSE", f"{accuracy.get('test_rmse', 0):.4f}")
+                        st.metric("Test R²", f"{r2:.4f}")
+                        st.metric("Test RMSE", f"{rmse:.4f}")
                     
                     with col2:
-                        st.metric("Test MAE", f"{accuracy.get('test_mae', 0):.4f}")
-                        st.metric("CV R² Mean", f"{accuracy.get('cv_r2_mean', 0):.4f}")
+                        st.metric("Test MAE", f"{mae:.4f}")
+                        st.metric("CV R²", f"{cv_r2:.4f}")
                     
                     with col3:
-                        st.metric("Training Samples", model.get('training_samples', 0))
-                        st.metric("Model Path", model.get('model_artifact_path', 'N/A'))
+                        st.metric("Training Samples", samples)
+                        st.metric("Model Type", "GradientBoosting")
                     
                     if model.get('feature_importance'):
                         fi = json.loads(model.get('feature_importance', '{}'))
@@ -747,10 +686,8 @@ def main():
         render_resource_charts(df)
     elif page == "ML Training":
         render_ml_training()
-    elif page == "ML Predictions":
-        render_ml_predictions()
-    elif page == "Optimization":
-        render_optimization()
+    elif page == "Optimizations":
+        render_optimizations()
     elif page == "Model Performance":
         render_model_performance()
 

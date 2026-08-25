@@ -285,8 +285,77 @@ class ResourcePredictor:
         
         return result
     
-    def save_models(self):
-        """Save trained models to disk."""
+    def predict_for_all_sizes(self, base_features: Dict, training_stats: Dict) -> Dict:
+        """
+        Generate predictions for small, medium, and large dataset scenarios.
+        
+        Args:
+            base_features: Base feature dictionary (without size-specific values)
+            training_stats: Statistics from training data (percentiles, etc.)
+        
+        Returns:
+            Dictionary with predictions for all 3 size scenarios
+        """
+        results = {}
+        
+        # Get size percentiles from training stats
+        disk_p25 = training_stats.get('disk_mb_p25', 1.0)
+        disk_p50 = training_stats.get('disk_mb_p50', 10.0)
+        disk_p75 = training_stats.get('disk_mb_p75', 50.0)
+        disk_max = training_stats.get('disk_mb_max', 100.0)
+        
+        # Define 3 scenarios
+        scenarios = {
+            'small': {
+                'disk_mb': disk_p25,
+                'size_encoded': 0.0
+            },
+            'medium': {
+                'disk_mb': disk_p50,
+                'size_encoded': 1.0
+            },
+            'large': {
+                'disk_mb': disk_p75,
+                'size_encoded': 2.0
+            }
+        }
+        
+        for size_name, size_params in scenarios.items():
+            # Create feature vector for this size scenario
+            features = base_features.copy()
+            
+            # Set size-specific features
+            features['disk_usage_mb'] = size_params['disk_mb']
+            features['size_category_encoded'] = size_params['size_encoded']
+            
+            # Scale per-GB features by target size
+            # (model learned per-GB usage, now scale to target size)
+            target_gb = size_params['disk_mb'] / 1000.0
+            if 'memory_per_gb' in base_features:
+                features['memory_per_gb'] = base_features.get('memory_per_gb', 0) * target_gb
+            if 'time_per_gb' in base_features:
+                features['time_per_gb'] = base_features.get('time_per_gb', 0) * target_gb
+            if 'cpu_per_gb' in base_features:
+                features['cpu_per_gb'] = base_features.get('cpu_per_gb', 0) * target_gb
+            
+            # Get predictions for this scenario
+            scenario_preds = {}
+            for resource_type in ['memory', 'time', 'cpu']:
+                pred_result = self.predict(features, resource_type)
+                if pred_result.get('success'):
+                    scenario_preds[resource_type] = pred_result
+            
+            if scenario_preds:
+                results[size_name] = {
+                    'predictions': scenario_preds,
+                    'disk_size_mb': size_params['disk_mb'],
+                    'extrapolation_factor': size_params['disk_mb'] / max(disk_max, 1)
+                }
+        
+        return results
+    
+    def save_models(self, training_stats: Dict = None):
+        """Save trained models and training statistics to disk."""
         for model_type in ['memory', 'time', 'cpu']:
             if self.models[model_type] is not None:
                 model_path = self.model_dir / f"{model_type}_model.joblib"
@@ -302,9 +371,16 @@ class ResourcePredictor:
                 
                 with open(features_path, 'w') as f:
                     json.dump(self.feature_columns.get(model_type, []), f, indent=2)
+        
+        # Save training statistics for multi-scenario predictions
+        if training_stats:
+            stats_path = self.model_dir / "training_stats.json"
+            with open(stats_path, 'w') as f:
+                json.dump(training_stats, f, indent=2)
+            print(f"✓ Saved training statistics to {stats_path}")
     
     def load_models(self):
-        """Load trained models from disk."""
+        """Load trained models and training statistics from disk."""
         for model_type in ['memory', 'time', 'cpu']:
             model_path = self.model_dir / f"{model_type}_model.joblib"
             scaler_path = self.model_dir / f"{model_type}_scaler.joblib"
@@ -324,11 +400,21 @@ class ResourcePredictor:
                 print(f"✓ Loaded {model_type} model")
             else:
                 print(f"⚠ No {model_type} model found")
+        
+        # Load training statistics
+        stats_path = self.model_dir / "training_stats.json"
+        if stats_path.exists():
+            with open(stats_path, 'r') as f:
+                self.training_stats = json.load(f)
+            print(f"✓ Loaded training statistics")
+        else:
+            self.training_stats = {}
+            print(f"⚠ No training statistics found")
 
 
 def train_all_models(df: pd.DataFrame, model_dir: str = "/code/models") -> Dict:
     """
-    Train all resource prediction models.
+    Train all resource prediction models with multi-scenario support.
     
     Args:
         df: DataFrame with features and targets
@@ -342,6 +428,21 @@ def train_all_models(df: pd.DataFrame, model_dir: str = "/code/models") -> Dict:
     
     predictor = ResourcePredictor(model_dir=model_dir)
     results = {}
+    
+    # Calculate training statistics for multi-scenario predictions
+    print("📊 Calculating training statistics...")
+    training_stats = {
+        'run_count': len(df),
+        'disk_mb_min': float(df['disk_usage_mb'].min()) if 'disk_usage_mb' in df else 0,
+        'disk_mb_max': float(df['disk_usage_mb'].max()) if 'disk_usage_mb' in df else 0,
+        'disk_mb_p25': float(df['disk_usage_mb'].quantile(0.25)) if 'disk_usage_mb' in df else 1.0,
+        'disk_mb_p50': float(df['disk_usage_mb'].median()) if 'disk_usage_mb' in df else 10.0,
+        'disk_mb_p75': float(df['disk_usage_mb'].quantile(0.75)) if 'disk_usage_mb' in df else 50.0,
+        'duration_p50': float(df['duration'].median()) if 'duration' in df else 3600,
+    }
+    print(f"   Runs: {training_stats['run_count']}")
+    print(f"   Disk range: {training_stats['disk_mb_min']:.2f} - {training_stats['disk_mb_max']:.2f} MB")
+    print(f"   Duration median: {training_stats['duration_p50']:.1f}s")
     
     # Train memory model
     print("Training memory prediction model...")
@@ -376,8 +477,11 @@ def train_all_models(df: pd.DataFrame, model_dir: str = "/code/models") -> Dict:
         results['cpu'] = {'error': 'Insufficient data', 'success': False}
         print(f"  ✗ Insufficient data for CPU model")
     
-    # Save models
-    predictor.save_models()
+    # Save models with training statistics
+    predictor.save_models(training_stats=training_stats)
     print(f"✓ Models saved to {model_dir}")
+    
+    # Add training stats to results
+    results['training_stats'] = training_stats
     
     return results

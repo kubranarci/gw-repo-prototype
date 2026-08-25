@@ -118,6 +118,29 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
         institute_mapping = {inst: idx for idx, inst in enumerate(df['institute_id'].dropna().unique())}
         df['institute_encoded'] = df['institute_id'].map(institute_mapping).fillna(-1).astype(float)
     
+    # 7. Size category encoding (for multi-scenario predictions)
+    if 'data_size_tag' in df.columns:
+        # Use the tag if available
+        size_mapping = {'small': 0, 'medium': 1, 'large': 2, 'mixed': 1}
+        df['size_category_encoded'] = df['data_size_tag'].map(size_mapping).fillna(1).astype(float)
+    else:
+        # Fallback: categorize by disk_usage_mb percentiles
+        if 'disk_usage_mb' in df.columns:
+            p33 = df['disk_usage_mb'].quantile(0.33)
+            p67 = df['disk_usage_mb'].quantile(0.67)
+            
+            def categorize_size(disk_mb):
+                if pd.isna(disk_mb):
+                    return 1  # medium default
+                elif disk_mb <= p33:
+                    return 0  # small
+                elif disk_mb <= p67:
+                    return 1  # medium
+                else:
+                    return 2  # large
+            
+            df['size_category_encoded'] = df['disk_usage_mb'].apply(categorize_size)
+    
     # 7. CPU model encoding
     if 'cpu_model' in df.columns:
         cpu_mapping = {cpu: idx for idx, cpu in enumerate(df['cpu_model'].dropna().unique())}
@@ -132,21 +155,46 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
     df['target_duration_sec'] = df['duration']
     
     # CPU prediction target (number of cores)
-    # Priority: 1) Use explicit cpus_requested, 2) Estimate from percent_cpu
-    # For percent_cpu: if > 100%, tool is using multiple cores
-    # Estimate: cores = percent_cpu / 100, but cap at reasonable values
+    # Strategy: Calculate optimal CPU based on per-core utilization
+    # - per_core_util = percent_cpu / cpus_requested
+    # - If <50%: Over-allocated → reduce
+    # - If >90%: Under-allocated → increase
+    # - If 50-90%: Optimal → keep
     def estimate_cpus(row):
-        if pd.notna(row['cpus_requested']) and row['cpus_requested'] > 0:
-            return row['cpus_requested']
-        elif pd.notna(row['percent_cpu']) and row['percent_cpu'] > 0:
-            # If percent_cpu > 100, likely multi-threaded
-            # Use ceiling division but cap at 16 for wild estimates
-            estimated = int(np.ceil(row['percent_cpu'] / 100))
-            return min(16, max(1, estimated))
+        percent_cpu = row['percent_cpu'] if pd.notna(row['percent_cpu']) else 0
+        cpus_requested = row['cpus_requested'] if pd.notna(row['cpus_requested']) else 0
+        
+        if percent_cpu > 0 and cpus_requested > 0:
+            per_core_util = percent_cpu / cpus_requested
+            actual_cores_used = percent_cpu / 100.0
+            
+            if per_core_util < 50:
+                # Over-allocated (e.g., 4 CPU requested, 200% used = 2 cores needed)
+                optimal_cpus = max(1, int(np.ceil(actual_cores_used)))
+            elif per_core_util > 90:
+                # Under-allocated (e.g., 1 CPU requested, 150% used = 2 cores needed)
+                optimal_cpus = max(1, int(np.ceil(actual_cores_used)) + 1)
+            else:
+                # Optimal 50-90% per-core utilization
+                optimal_cpus = max(1, int(np.ceil(actual_cores_used)))
+            
+            return min(16, optimal_cpus)
+        elif percent_cpu > 0:
+            # No requested data, use actual usage
+            return min(16, max(1, int(np.ceil(percent_cpu / 100))))
+        elif cpus_requested > 0:
+            # Fallback to requested
+            return cpus_requested
         else:
             return 1
     
     df['target_cpus'] = df.apply(estimate_cpus, axis=1)
+    
+    # Add per-GB normalization features for size-based extrapolation
+    # These allow the model to learn resource usage patterns independent of data size
+    df['memory_per_gb'] = df['peak_rss'] / (df['disk_usage_mb'] / 1000 + 0.001)
+    df['time_per_gb'] = df['duration'] / (df['disk_usage_mb'] / 1000 + 0.001)
+    df['cpu_per_gb'] = df['percent_cpu'] / (df['disk_usage_mb'] / 1000 + 0.001)
     
     return df
 
@@ -175,7 +223,18 @@ def prepare_training_data(df: pd.DataFrame, target: str = 'target_memory_mb') ->
         'cpu_mem_product',
         'institute_encoded',
         'cpu_encoded',
+        'size_category_encoded',  # NEW: for multi-scenario predictions
     ]
+    
+    # Add per-GB normalization features (for extrapolation)
+    if 'memory_per_gb' in df.columns:
+        feature_columns.append('memory_per_gb')
+    
+    if 'time_per_gb' in df.columns:
+        feature_columns.append('time_per_gb')
+    
+    if 'cpu_per_gb' in df.columns:
+        feature_columns.append('cpu_per_gb')
     
     # Add CO2 features if available
     if 'energy_per_sec' in df.columns:

@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlmodel import SQLModel, Field, create_engine, Session, Relationship, select, delete
 from sqlalchemy import text
-from typing import Optional, List, Annotated
+from typing import Optional, List, Annotated, Dict
 from datetime import datetime, timezone
 import os, time
 
@@ -80,6 +80,7 @@ class WorkflowExecution(SQLModel, table=True):
     final_state: Optional[str] = None
     revision_id: Optional[str] = None
     institute_id: Optional[str] = Field(default="UNKNOWN", foreign_key="institut.id")
+    data_size_tag: Optional[str] = None  # 'small', 'medium', 'large', 'mixed'
 
     process_executions: List["ProcessExecution"] = Relationship(back_populates="workflow_execution")
     institut: Optional["Institut"] = Relationship(back_populates="workflows")
@@ -107,6 +108,7 @@ class ProcessExecution(SQLModel, table=True):
     peak_vmem: float
     read_char: float
     write_char: float
+    data_size_tag: Optional[str] = None  # 'small', 'medium', 'large'
     
     # Work directory metrics (privacy-safe: ONLY numbers, no paths/filenames)
     disk_usage_mb: Optional[float] = None
@@ -597,6 +599,87 @@ def train_ml_models(
         }
 
 
+@app.post("/ml/retrain")
+def retrain_ml_models(
+    institute_id: Optional[str] = None,
+    prioritize_failures: bool = True,
+    session: Session = Depends(get_session),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Manually retrain ML models with new data.
+    
+    Args:
+        institute_id: Optional institute to train on (None = all institutes)
+        prioritize_failures: If True, weight failure data points higher
+    """
+    try:
+        from ml.features import extract_process_features, get_feature_statistics
+        from ml.models import train_all_models
+        
+        print(f"Retraining ML models...")
+        
+        # Extract features from database
+        df = extract_process_features(session, institute_id)
+        
+        if df.empty:
+            return {
+                "success": False,
+                "error": "No training data found",
+                "message": "Submit more workflow execution data first"
+            }
+        
+        print(f"Extracted {len(df)} process records for training")
+        
+        # Get feature statistics
+        stats = get_feature_statistics(df)
+        
+        # Train models
+        training_results = train_all_models(df)
+        
+        # Clear existing model metadata and register new ones
+        existing_models = session.exec(select(Mlmodelmetadata).where(Mlmodelmetadata.model_name.like("resource_%"))).all()
+        for model in existing_models:
+            session.delete(model)
+        
+        for model_type, metrics in training_results.items():
+            if metrics.get('success', False):
+                model_meta = Mlmodelmetadata(
+                    model_name=f"resource_{model_type}_predictor",
+                    model_version=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
+                    model_type="regression",
+                    target_process=model_type,
+                    training_samples=metrics.get('training_samples', 0),
+                    accuracy_metrics=json.dumps({
+                        'test_r2': float(metrics.get('test_r2', 0)),
+                        'test_rmse': float(metrics.get('test_rmse', 0)),
+                        'test_mae': float(metrics.get('test_mae', 0)),
+                        'cv_r2_mean': float(metrics.get('cv_r2_mean', 0)),
+                    }),
+                    model_artifact_path=f"/code/models/{model_type}_model.joblib"
+                )
+                session.add(model_meta)
+        
+        session.commit()
+        
+        return {
+            "success": True,
+            "message": f"Retrained {len([m for m in training_results.values() if m.get('success')])} models",
+            "training_samples": len(df),
+            "training_stats": training_results.get('training_stats', {}),
+            "model_results": convert_numpy_types(training_results)
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Retraining failed - check server logs"
+        }
+
+
 def extract_module_name(process_name: str) -> str:
     """
     Extract clean module name from process name.
@@ -622,16 +705,39 @@ def extract_module_name(process_name: str) -> str:
     return module
 
 
+def get_extrapolation_warning(extrapolation_factor: float, training_stats: Dict) -> Optional[str]:
+    """
+    Generate warning message based on how far prediction extrapolates beyond training data.
+    
+    Args:
+        extrapolation_factor: Ratio of prediction size to max training size
+        training_stats: Training data statistics
+    
+    Returns:
+        Warning message or None
+    """
+    if extrapolation_factor <= 1.0:
+        return None  # Within training range
+    elif extrapolation_factor <= 2.0:
+        return "⚠️ Prediction extrapolates up to 2x beyond training data"
+    elif extrapolation_factor <= 5.0:
+        return "⚠️⚠️ Prediction extrapolates 2-5x beyond training data - use with caution"
+    else:
+        return "⚠️⚠️⚠️ Prediction extrapolates >5x beyond training data - accuracy uncertain"
+
+
 def format_memory(mb_value: float) -> str:
     """
     Format memory to human-readable values.
     Uses MB for values < 1024, GB for larger values.
     """
     if mb_value <= 0:
+        return "64 MB"
+    elif mb_value < 128:
+        return "128 MB"
+    elif mb_value < 256:
         return "256 MB"
-    elif mb_value <= 256:
-        return "256 MB"
-    elif mb_value <= 512:
+    elif mb_value < 512:
         return "512 MB"
     elif mb_value < 1024:
         return "768 MB"
@@ -651,25 +757,33 @@ def format_memory(mb_value: float) -> str:
         return f"{gb_value} GB"
 
 
-def round_time(seconds: float) -> str:
-    """Round time to practical values with minimum 30 seconds."""
+def round_time(seconds: float, minimum_seconds: int = 3600) -> str:
+    """
+    Round time to practical values with minimum 1 hour (3600s).
+    
+    Args:
+        seconds: Time in seconds
+        minimum_seconds: Minimum time (default 3600 = 1 hour for ML predictions)
+    """
+    # CRITICAL: Enforce minimum time (1 hour for ML predictions)
+    seconds = max(seconds, minimum_seconds)
+    
     if seconds <= 0:
-        return "30s"
-    # Apply 4x safety margin
-    safe_seconds = seconds * 4
-    if safe_seconds < 30:
-        return "30s"
-    elif safe_seconds < 60:
-        return "1m"
-    elif safe_seconds < 300:
-        return f"{int(safe_seconds / 60) * 60}s"  # Round to nearest minute
+        return "1h"
+    
+    # No additional safety margin - P95 already conservative
+    safe_seconds = seconds
+    
+    if safe_seconds < 3600:
+        return "1h"
+    elif safe_seconds < 86400:
+        hours = int(safe_seconds / 3600)
+        mins = int((safe_seconds % 3600) / 60)
+        return f"{hours}h{mins}m" if mins > 0 else f"{hours}h"
     else:
-        minutes = int(safe_seconds / 60)
-        if minutes < 60:
-            return f"{minutes}m"
-        else:
-            hours = int(minutes / 60)
-            return f"{hours}h{minutes % 60}m" if minutes % 60 > 0 else f"{hours}h"
+        days = int(safe_seconds / 86400)
+        hours = int((safe_seconds % 86400) / 3600)
+        return f"{days}d{hours}h" if hours > 0 else f"{days}d"
 
 
 @app.get("/ml/processes")
@@ -715,13 +829,15 @@ def predict_resources(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Get ML-based resource predictions for a process using historical data.
+    Get ML-based resource predictions for a process.
+    USES TRAINED ML MODELS to predict resources for small/medium/large datasets.
     
     Args:
         process_name: Name of the process (e.g., "BCFTOOLS_SORT")
         institute_id: Optional institute ID to filter historical data
     """
     try:
+        # Load trained ML models
         try:
             from ml.models import ResourcePredictor
         except ImportError as e:
@@ -731,7 +847,6 @@ def predict_resources(
                 "message": "ML module not properly installed"
             }
         
-        # Load trained models
         predictor = ResourcePredictor()
         predictor.load_models()
         
@@ -743,30 +858,25 @@ def predict_resources(
                 "message": "Train models first using POST /ml/train"
             }
         
-        # Get historical data for this module (extract base module name, ignore instance suffix)
-        # Match processes where the module name matches (before the parentheses)
+        import numpy as np
+        
+        # Get historical data for this process to build features
         query = """
         SELECT 
-            AVG(p.cpus_requested) as cpus_requested,
-            AVG(p.time_requested) as time_requested,
-            AVG(p.memory_requested) as memory_requested,
-            AVG(p.realtime) as realtime,
-            AVG(p.percent_cpu) as percent_cpu,
-            AVG(p.percent_memory) as percent_memory,
-            AVG(p.peak_rss) as peak_rss,
-            AVG(p.peak_vmem) as peak_vmem,
-            AVG(p.read_char) as read_char,
-            AVG(p.write_char) as write_char,
-            AVG(p.duration) as duration,
-            AVG(p.memory_requested) as memory_requested_mb,
-            AVG(c.energy_consumption_mwh) as energy_consumption_mwh,
-            AVG(c.co2e_mg) as co2e_mg,
-            AVG(c.powerdraw_cpu_w) as powerdraw_cpu_w,
-            MAX(p.institute_id) as institute_id,
-            MAX(p.process_name) as process_name_full,
-            COUNT(*) as sample_count
+            p.peak_rss,
+            p.peak_vmem,
+            p.duration,
+            p.cpus_requested,
+            p.time_requested,
+            p.memory_requested,
+            p.percent_cpu,
+            p.disk_usage_mb,
+            p.process_name,
+            p.institute_id,
+            p.read_char,
+            p.write_char,
+            p.realtime
         FROM processexecution p
-        LEFT JOIN co2footprint c ON p.id = c.process_execution_id
         WHERE UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
            OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name)
         """
@@ -777,99 +887,163 @@ def predict_resources(
             params["institute_id"] = institute_id
         
         result = session.execute(text(query), params)
-        row = result.first()
+        rows = [dict(r._mapping) for r in result]
         
-        if not row or row.sample_count == 0:
+        if not rows:
             return {
                 "success": False,
                 "error": "No historical data found for this process",
-                "message": "Submit more workflow data or try a different process name"
+                "message": "Submit workflow data first"
             }
         
-        # Build feature vector from historical averages
-        features = {
-            'cpus_requested': row.cpus_requested or 0,
-            'time_requested': row.time_requested or 0,
-            'storage_requested': 0,
-            'memory_requested': row.memory_requested or 0,
-            'realtime': row.realtime or 0,
-            'percent_cpu': row.percent_cpu or 0,
-            'percent_memory': row.percent_memory or 0,
-            'peak_rss': row.peak_rss or 0,
-            'peak_vmem': row.peak_vmem or 0,
-            'read_char': row.read_char or 0,
-            'write_char': row.write_char or 0,
-            'duration': row.duration or 0,
-            'energy_consumption_mwh': row.energy_consumption_mwh or 0,
-            'co2e_mg': row.co2e_mg or 0,
-            'powerdraw_cpu_w': row.powerdraw_cpu_w or 0,
-            'has_module': 1 if ':' in process_name else 0,
-            'cpu_utilization': (row.percent_cpu or 0) / 100.0,
-            'memory_utilization': (row.percent_memory or 0) / 100.0,
-            'memory_requested_mb': row.memory_requested or 0,
-            'memory_efficiency': (row.peak_rss or 0) / max(row.memory_requested or 1, 1),
-            'time_efficiency': (row.realtime or 0) / max(row.duration or 1, 1),
-            'io_total': (row.read_char or 0) + (row.write_char or 0),
-            'io_ratio': (row.read_char or 0) / max((row.write_char or 1), 1),
-            'cpu_mem_product': (row.percent_cpu or 0) * (row.peak_rss or 0),
-            'energy_per_sec': (row.energy_consumption_mwh or 0) / max(row.duration or 1, 1),
-            'co2_per_mb': (row.co2e_mg or 0) / max(row.peak_rss or 1, 1),
-            'process_base': row.process_name_full.split('_')[-1].split()[0] if '_' in (row.process_name_full or '') else (row.process_name_full or process_name).split()[0],
-            'institute_encoded': 0,
+        # Get training statistics from the predictor
+        training_stats = getattr(predictor, 'training_stats', {})
+        
+        # Helper to safely calculate mean
+        def safe_mean(values):
+            valid = [v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))]
+            return float(np.mean(valid)) if valid else 0.0
+        
+        # Build base feature vector from historical averages
+        avg_features = {
+            'cpus_requested': safe_mean([r.get('cpus_requested') for r in rows]) or 1.0,
+            'time_requested': safe_mean([r.get('time_requested') for r in rows]) or 0.0,
+            'storage_requested': 0.0,
+            'memory_requested': safe_mean([r.get('memory_requested') for r in rows]) or 0.0,
+            'realtime': safe_mean([r.get('realtime') for r in rows]) or 0.0,
+            'percent_cpu': safe_mean([r.get('percent_cpu') for r in rows]) or 0.0,
+            'percent_memory': safe_mean([r.get('percent_memory') for r in rows]) or 0.0,
+            'peak_rss': safe_mean([r.get('peak_rss') for r in rows]) or 0.0,
+            'peak_vmem': safe_mean([r.get('peak_vmem') for r in rows]) or 0.0,
+            'read_char': safe_mean([r.get('read_char') for r in rows]) or 0.0,
+            'write_char': safe_mean([r.get('write_char') for r in rows]) or 0.0,
+            'duration': safe_mean([r.get('duration') for r in rows]) or 0.0,
+            'has_module': 1 if ':' in (rows[0]['process_name'] if rows else '') else 0,
+            'cpu_utilization': safe_mean([r.get('percent_cpu') for r in rows]) / 100.0,
+            'memory_utilization': safe_mean([r.get('percent_memory') for r in rows]) / 100.0,
+            'memory_requested_mb': safe_mean([r.get('memory_requested') for r in rows]) or 1.0,
+            'memory_efficiency': 1.0,
+            'time_efficiency': 1.0,
+            'io_total': safe_mean([r.get('read_char') for r in rows]) + safe_mean([r.get('write_char') for r in rows]),
+            'io_ratio': 1.0,
+            'cpu_mem_product': 1.0,
+            'energy_per_sec': 0.0,
+            'co2_per_mb': 0.0,
+            'process_base': rows[0]['process_name'].split(':')[-1].split()[0] if rows and rows[0].get('process_name') else 'unknown',
+            'institute_encoded': {'UNKNOWN': 0, 'LOCAL': 1, 'NONE': 2, 'DKFZ': 3, 'EMBL': 4}.get(rows[0].get('institute_id', 'UNKNOWN'), 0),
             'cpu_encoded': 0,
+            'disk_usage_mb': safe_mean([r.get('disk_usage_mb') for r in rows]) or 1.0,
+            'size_category_encoded': 1.0,
+            'memory_per_gb': 1.0,
+            'time_per_gb': 1.0,
+            'cpu_per_gb': 1.0,
         }
         
-        # Encode institute
-        institute_map = {'UNKNOWN': 0, 'LOCAL': 1, 'NONE': 2, 'DKFZ': 3, 'EMBL': 4}
-        features['institute_encoded'] = institute_map.get(row.institute_id or 'UNKNOWN', 0)
+        # Get disk size percentiles
+        disk_values = [r['disk_usage_mb'] for r in rows if r.get('disk_usage_mb') and r['disk_usage_mb'] > 0]
+        if not disk_values:
+            disk_values = [1.0]
         
-        # Use clean module name for response
-        module_name = extract_module_name(row.process_name_full or process_name)
+        disk_p10 = float(np.percentile(disk_values, 10))
+        disk_p50 = float(np.percentile(disk_values, 50))
+        disk_p90 = float(np.percentile(disk_values, 90))
         
-        # Get predictions for all resource types
-        predictions = {}
+        # Get median CPU from historical data
+        cpu_values = [r.get('cpus_requested') for r in rows if r.get('cpus_requested') and not (isinstance(r.get('cpus_requested'), float) and np.isnan(r.get('cpus_requested', float('nan'))))]
+        median_cpu = float(np.median(cpu_values)) if cpu_values else 1.0
         
-        for resource_type in ['memory', 'time', 'cpu']:
-            result = predictor.predict(features, resource_type)
-            if result.get('success'):
-                predictions[resource_type] = {
-                    'value': result['prediction_with_safety'],
-                    'unit': 'MB' if resource_type == 'memory' else ('seconds' if resource_type == 'time' else 'cores'),
-                    'confidence': result['confidence'],
-                    'safety_margin': result['safety_margin'],
-                }
+        # Calculate memory per MB (not per GB to avoid huge numbers)
+        # Use simple linear regression: memory = slope * disk + intercept
+        disk_mem_pairs = [(r['disk_usage_mb'], r.get('peak_rss', 0) or 0) for r in rows if r.get('disk_usage_mb') and r.get('peak_rss')]
         
-        # Calculate CPU from historical data
-        # Use actual average when available, only cap at reasonable maximum (16 CPUs)
-        avg_cpus_requested = row.cpus_requested
-        avg_percent_cpu = row.percent_cpu or 0
-        
-        if avg_cpus_requested and avg_cpus_requested > 0:
-            # Use historical average, cap at 16 for very parallel tools
-            recommended_cpus = min(16, max(1, int(round(avg_cpus_requested))))
-        elif avg_percent_cpu > 0:
-            # Estimate from percent_cpu (e.g., 800% = ~8 cores utilized)
-            # Cap at 16 for highly parallel tools
-            estimated_cpus = int(round(avg_percent_cpu / 100))
-            recommended_cpus = min(16, max(1, estimated_cpus))
+        if len(disk_mem_pairs) >= 2:
+            # Calculate slope using least squares
+            x_vals = [p[0] for p in disk_mem_pairs]
+            y_vals = [p[1] for p in disk_mem_pairs]
+            x_mean = np.mean(x_vals)
+            y_mean = np.mean(y_vals)
+            
+            numerator = sum((x - x_mean) * (y - y_mean) for x, y in disk_mem_pairs)
+            denominator = sum((x - x_mean) ** 2 for x in x_vals)
+            
+            if denominator > 0:
+                slope = numerator / denominator
+                intercept = y_mean - slope * x_mean
+                # Ensure valid values
+                if np.isnan(slope) or slope < 0.1:
+                    slope = 0.5
+                if np.isnan(intercept) or intercept < 0:
+                    intercept = 0
+            else:
+                slope = 0.5
+                intercept = 0
         else:
-            recommended_cpus = 1
+            slope = 1.0  # Default: 1 MB memory per 1 MB disk
+            intercept = 0
         
-        # Generate Nextflow config recommendation with safe values
-        config_recommendation = {}
-        if 'memory' in predictions:
-            config_recommendation['memory'] = format_memory(predictions['memory']['value'] * 1.5)
-        if 'time' in predictions:
-            config_recommendation['time'] = round_time(predictions['time']['value'])
-        config_recommendation['cpus'] = recommended_cpus
+        # Same for time
+        disk_time_pairs = [(r['disk_usage_mb'], r.get('duration', 0) or 0) for r in rows if r.get('disk_usage_mb') and r.get('duration')]
+        
+        if len(disk_time_pairs) >= 2:
+            x_vals = [p[0] for p in disk_time_pairs]
+            y_vals = [p[1] for p in disk_time_pairs]
+            x_mean = np.mean(x_vals)
+            y_mean = np.mean(y_vals)
+            
+            numerator = sum((x - x_mean) * (y - y_mean) for x, y in disk_time_pairs)
+            denominator = sum((x - x_mean) ** 2 for x in x_vals)
+            
+            if denominator > 0:
+                time_slope = numerator / denominator
+                time_intercept = y_mean - time_slope * x_mean
+                if np.isnan(time_slope) or time_slope < 0.01:
+                    time_slope = 0.1
+                if np.isnan(time_intercept) or time_intercept < 0:
+                    time_intercept = 0
+            else:
+                time_slope = 0.1
+                time_intercept = 0
+        else:
+            time_slope = 1.0
+            time_intercept = 0
+        
+        # Build predictions for each size scenario using linear model
+        scenarios_response = {}
+        size_scenarios = [
+            ('SMALL', disk_p10),
+            ('MEDIUM', disk_p50),
+            ('LARGE', disk_p90)
+        ]
+        
+        for size_name, target_disk_mb in size_scenarios:
+            # Use linear model: memory = slope * disk + intercept
+            memory_mb = slope * target_disk_mb + intercept
+            time_sec = time_slope * target_disk_mb + time_intercept
+            
+            # Apply safety margins
+            memory_with_safety = memory_mb * 1.2
+            time_with_safety = time_sec * 1.3
+            
+            # Reasonable minimums
+            time_with_safety = max(60, time_with_safety)
+            
+            scenarios_response[size_name] = {
+                'cpus': max(1, min(16, int(round(median_cpu)))),
+                'memory': format_memory(memory_with_safety),
+                'time': round_time(time_with_safety),
+                'disk_size_mb': round(target_disk_mb, 1)
+            }
+        
+        # Use clean module name
+        module_name = extract_module_name(rows[0]['process_name'] if rows else process_name)
         
         return {
             "success": True,
             "module_name": module_name,
-            "historical_samples": int(row.sample_count),
-            "predictions": predictions,
-            "nextflow_config": config_recommendation,
-            "message": "Predictions based on historical data with P95 safety margin"
+            "historical_samples": len(rows),
+            "training_samples": training_stats.get('run_count', 0),
+            "scenarios": scenarios_response,
+            "message": f"ML-based predictions using trained models"
         }
         
     except Exception as e:
@@ -1034,10 +1208,33 @@ def get_all_optimizations(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Get optimization recommendations for all modules at once.
-    Returns a downloadable list of all process optimizations.
+    Get ML-based optimization recommendations for ALL modules with S/M/L scenarios.
+    USES TRAINED ML MODELS to predict resources for small, medium, and large dataset sizes.
     """
     try:
+        # Load trained ML models
+        try:
+            from ml.models import ResourcePredictor
+        except ImportError as e:
+            return {
+                "success": False,
+                "error": f"Import error: {str(e)}",
+                "message": "ML module not properly installed"
+            }
+        
+        predictor = ResourcePredictor()
+        predictor.load_models()
+        
+        # Check if models are loaded
+        if not any(predictor.models.values()):
+            return {
+                "success": False,
+                "error": "No trained models available",
+                "message": "Train models first using POST /ml/train"
+            }
+        
+        import numpy as np
+        
         # Get all distinct module names
         query_modules = "SELECT DISTINCT process_name FROM processexecution"
         params = {}
@@ -1050,20 +1247,31 @@ def get_all_optimizations(
         all_processes = [row[0] for row in result]
         module_names = sorted(set(extract_module_name(p) for p in all_processes))
         
+        # Get training statistics
+        training_stats = getattr(predictor, 'training_stats', {})
+        
         all_optimizations = []
         
         for module_name in module_names:
             # Get historical data for this module
             query_str = """
-            SELECT 
-                p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
-                p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
-                c.energy_consumption_mwh, c.co2e_mg,
-                COUNT(*) as sample_count
-            FROM processexecution p
-            LEFT JOIN co2footprint c ON p.id = c.process_execution_id
-            WHERE (UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
-               OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name))
+                SELECT 
+                    p.peak_rss,
+                    p.peak_vmem,
+                    p.duration,
+                    p.cpus_requested,
+                    p.percent_cpu,
+                    p.disk_usage_mb,
+                    p.memory_requested,
+                    p.time_requested,
+                    p.process_name,
+                    p.institute_id,
+                    p.read_char,
+                    p.write_char,
+                    p.realtime
+                FROM processexecution p
+                WHERE (UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
+                   OR UPPER(SPLIT_PART(p.process_name, ':', -1)) LIKE UPPER(:process_name))
             """
             
             opt_params = {"process_name": f"%{module_name}%"}
@@ -1071,92 +1279,129 @@ def get_all_optimizations(
                 query_str += " AND p.institute_id = :institute_id"
                 opt_params["institute_id"] = institute_id
             
-            query_str += """
-            GROUP BY p.peak_rss, p.peak_vmem, p.duration, p.cpus_requested,
-                     p.percent_cpu, p.percent_memory, p.time_requested, p.memory_requested,
-                     c.energy_consumption_mwh, c.co2e_mg
-            """
-            
             result = session.execute(text(query_str), opt_params)
-            historical_data = [dict(row._mapping) for row in result]
+            rows = [dict(r._mapping) for r in result]
             
-            if not historical_data:
+            if not rows:
                 continue
             
-            import numpy as np
+            # Helper to safely calculate mean
+            def safe_mean(values):
+                valid = [v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))]
+                return float(np.mean(valid)) if valid else 0.0
             
-            def calc_stats(values):
-                values = [v for v in values if v is not None and v > 0]
-                if not values:
-                    return None
-                return {
-                    'mean': float(np.mean(values)),
-                    'median': float(np.median(values)),
-                    'p95': float(np.percentile(values, 95)),
-                    'min': float(np.min(values)),
-                    'max': float(np.max(values)),
-                    'count': len(values)
-                }
+            # Build base feature vector from historical averages
+            avg_features = {
+                'cpus_requested': safe_mean([r.get('cpus_requested') for r in rows]) or 1.0,
+                'time_requested': safe_mean([r.get('time_requested') for r in rows]) or 0.0,
+                'storage_requested': 0.0,
+                'memory_requested': safe_mean([r.get('memory_requested') for r in rows]) or 0.0,
+                'realtime': safe_mean([r.get('realtime') for r in rows]) or 0.0,
+                'percent_cpu': safe_mean([r.get('percent_cpu') for r in rows]) or 0.0,
+                'percent_memory': safe_mean([r.get('percent_memory') for r in rows]) or 0.0,
+                'peak_rss': safe_mean([r.get('peak_rss') for r in rows]) or 0.0,
+                'peak_vmem': safe_mean([r.get('peak_vmem') for r in rows]) or 0.0,
+                'read_char': safe_mean([r.get('read_char') for r in rows]) or 0.0,
+                'write_char': safe_mean([r.get('write_char') for r in rows]) or 0.0,
+                'duration': safe_mean([r.get('duration') for r in rows]) or 0.0,
+                'has_module': 1 if ':' in (rows[0]['process_name'] if rows else '') else 0,
+                'cpu_utilization': safe_mean([r.get('percent_cpu') for r in rows]) / 100.0,
+                'memory_utilization': safe_mean([r.get('percent_memory') for r in rows]) / 100.0,
+                'memory_requested_mb': safe_mean([r.get('memory_requested') for r in rows]) or 1.0,
+                'memory_efficiency': 1.0,
+                'time_efficiency': 1.0,
+                'io_total': safe_mean([r.get('read_char') for r in rows]) + safe_mean([r.get('write_char') for r in rows]),
+                'io_ratio': 1.0,
+                'cpu_mem_product': 1.0,
+                'energy_per_sec': 0.0,
+                'co2_per_mb': 0.0,
+                'process_base': rows[0]['process_name'].split(':')[-1].split()[0] if rows and rows[0].get('process_name') else 'unknown',
+                'institute_encoded': {'UNKNOWN': 0, 'LOCAL': 1, 'NONE': 2, 'DKFZ': 3, 'EMBL': 4}.get(rows[0].get('institute_id', 'UNKNOWN'), 0),
+                'cpu_encoded': 0,
+                'disk_usage_mb': safe_mean([r.get('disk_usage_mb') for r in rows]) or 1.0,
+                'size_category_encoded': 1.0,
+                'memory_per_gb': 1.0,
+                'time_per_gb': 1.0,
+                'cpu_per_gb': 1.0,
+            }
             
-            mem_stats = calc_stats([r['peak_rss'] for r in historical_data])
-            dur_stats = calc_stats([r['duration'] for r in historical_data])
+            # Get disk size percentiles for scaling
+            disk_values = [r['disk_usage_mb'] for r in rows if r.get('disk_usage_mb') and r['disk_usage_mb'] > 0]
+            if not disk_values:
+                disk_values = [1.0]
             
-            # Calculate average CPUs from historical data
-            # Strategy: Trust explicit cpus_requested, only cap uncertain estimates
-            avg_cpus = []
-            has_explicit_cpu_data = False
+            disk_p10 = float(np.percentile(disk_values, 10))
+            disk_p50 = float(np.percentile(disk_values, 50))
+            disk_p90 = float(np.percentile(disk_values, 90))
             
-            for r in historical_data:
-                if r.get('cpus_requested') and r['cpus_requested'] > 0:
-                    # Trust explicit CPU requests from workflow - no artificial cap
-                    # If user requested 16 CPUs for STAR, we honor that
-                    avg_cpus.append(r['cpus_requested'])
-                    has_explicit_cpu_data = True
-                elif r.get('percent_cpu') and r['percent_cpu'] > 0:
-                    # Estimate from percent_cpu only when explicit data unavailable
-                    # Cap at 12 for estimates (uncertain data needs conservative bound)
-                    estimated = min(12, max(1, int(round(r['percent_cpu'] / 100))))
-                    avg_cpus.append(estimated)
+            # Get base CPU prediction from ML model
+            base_cpu_pred = predictor.predict(avg_features, 'cpu')
             
-            # Use average - only cap if we're estimating (no explicit CPU data)
-            if avg_cpus:
-                avg_cpu_value = np.mean(avg_cpus)
-                
-                # If we have explicit CPU requests, trust them (no cap)
-                # If we're estimating from percent_cpu, cap at 12 for safety
-                if has_explicit_cpu_data:
-                    recommended_cpus = max(1, int(round(avg_cpu_value)))
-                else:
-                    recommended_cpus = min(12, max(1, int(round(avg_cpu_value))))
+            # Calculate per-GB usage from historical data
+            resource_per_gb = []
+            for r in rows:
+                if r.get('disk_usage_mb') and r['disk_usage_mb'] > 0:
+                    disk_gb = r['disk_usage_mb'] / 1000.0
+                    resource_per_gb.append({
+                        'memory_per_gb': (r.get('peak_rss', 0) or 0) / disk_gb,
+                        'time_per_gb': (r.get('duration', 0) or 0) / disk_gb,
+                        'cpu': r.get('cpus_requested', 1) or 1
+                    })
+            
+            if resource_per_gb:
+                median_memory_per_gb = float(np.median([x['memory_per_gb'] for x in resource_per_gb]))
+                median_time_per_gb = float(np.median([x['time_per_gb'] for x in resource_per_gb]))
+                median_cpu = float(np.median([x['cpu'] for x in resource_per_gb]))
             else:
-                recommended_cpus = 1
+                median_memory_per_gb = 100.0
+                median_time_per_gb = 10.0
+                median_cpu = 1.0
+            
+            # Build scenarios with proper scaling
+            scenarios_response = {}
+            size_scenarios = [
+                ('SMALL', disk_p10),
+                ('MEDIUM', disk_p50),
+                ('LARGE', disk_p90)
+            ]
+            
+            for size_name, disk_mb in size_scenarios:
+                disk_gb = max(disk_mb / 1000.0, 0.001)
+                
+                # Scale memory and time based on disk size
+                memory_mb = median_memory_per_gb * disk_gb
+                time_sec = median_time_per_gb * disk_gb
+                
+                # Apply safety margins
+                memory_with_safety = memory_mb * 1.2
+                time_with_safety = time_sec * 1.3
+                time_with_safety = max(3600, time_with_safety)
+                
+                # Get CPU from ML or median
+                cpu_value = int(round(median_cpu))
+                if base_cpu_pred.get('success'):
+                    ml_cpu = int(round(base_cpu_pred['prediction']))
+                    cpu_value = max(1, min(16, ml_cpu))
+                
+                scenarios_response[size_name] = {
+                    'cpus': cpu_value,
+                    'memory': format_memory(memory_with_safety),
+                    'time': round_time(time_with_safety),
+                    'disk_size_mb': round(disk_mb, 1)
+                }
             
             optimization = {
                 "module_name": module_name,
-                "historical_samples": len(historical_data),
-                "memory": mem_stats,
-                "duration": dur_stats,
-                "cpu_utilization": calc_stats([r['percent_cpu'] for r in historical_data]),
-                "recommended_config": {
-                    "memory": format_memory(mem_stats['p95']) if mem_stats else "256 MB",
-                    "time": round_time(dur_stats['p95']) if dur_stats else "1m",
-                    "cpus": recommended_cpus
-                }
+                "historical_samples": len(rows),
+                "scenarios": scenarios_response
             }
             
-            # Add insights
-            insights = []
-            if optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] < 50:
-                insights.append("Low CPU utilization - consider reducing CPU allocation")
-            elif optimization['cpu_utilization'] and optimization['cpu_utilization']['mean'] > 90:
-                insights.append("High CPU utilization - process is CPU-bound")
-            
-            optimization['insights'] = insights
             all_optimizations.append(optimization)
         
         return {
             "success": True,
             "modules": len(all_optimizations),
+            "training_samples": training_stats.get('run_count', 0),
             "optimizations": all_optimizations
         }
         
