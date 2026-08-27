@@ -526,7 +526,7 @@ def train_ml_models(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Train ML models on historical workflow data.
+    Train per-process ML models on historical workflow data.
     
     Args:
         institute_id: Optional institute to train on (None = all institutes)
@@ -534,7 +534,8 @@ def train_ml_models(
     try:
         try:
             from ml.features import extract_process_features, get_feature_statistics
-            from ml.models import train_all_models, ResourcePredictor
+            from ml.models import ResourcePredictor
+            from nfcore_modules import normalize_module_name
         except ImportError as e:
             return {
                 "success": False,
@@ -542,7 +543,7 @@ def train_ml_models(
                 "message": "ML module not properly installed"
             }
         
-        print(f"Training ML models{'for institute ' + institute_id if institute_id else 'for all institutes'}...")
+        print(f"Training per-process ML models{'for institute ' + institute_id if institute_id else 'for all institutes'}...")
         
         # Extract features from database
         df = extract_process_features(session, institute_id)
@@ -556,42 +557,110 @@ def train_ml_models(
         
         print(f"Extracted {len(df)} process records for training")
         
+        # Normalize module names using nf-core cache
+        print("Normalizing module names...")
+        df['module_name'] = df['process_name'].apply(normalize_module_name)
+        
         # Get feature statistics
         stats = get_feature_statistics(df)
         
-        # Train models
-        training_results = train_all_models(df)
+        # Train per-process models
+        predictor = ResourcePredictor()
+        training_results = predictor.train_all_process_models(df, institute_id)
         
-        # Register models in database
-        for model_type, metrics in training_results.items():
+        # Clear old model metadata
+        existing_models = session.exec(select(Mlmodelmetadata)).all()
+        for model in existing_models:
+            session.delete(model)
+        
+        # Register per-process models in database
+        for process_name, process_results in training_results.get('per_process', {}).items():
+            if process_results.get('status') == 'trained':
+                for resource_type, metrics in process_results.get('models', {}).items():
+                    if metrics.get('success', False):
+                        model_meta = Mlmodelmetadata(
+                            process_name=process_name,
+                            resource_type=resource_type,
+                            model_type="gradient_boosting",
+                            training_samples=metrics.get('training_samples', 0),
+                            accuracy_metrics=json.dumps({
+                                'test_r2': float(metrics.get('test_r2', 0)),
+                                'test_rmse': float(metrics.get('test_rmse', 0)),
+                                'test_mae': float(metrics.get('test_mae', 0)),
+                                'cv_r2_mean': float(metrics.get('cv_r2_mean', 0)),
+                                'feature_importance': metrics.get('feature_importance', {}),
+                            }),
+                            model_artifact_path=f"/code/models/{process_name}_{resource_type}.pkl",
+                            is_fallback_model=False
+                        )
+                        session.add(model_meta)
+        
+        # Register fallback models
+        for resource_type, metrics in training_results.get('fallback', {}).items():
             if metrics.get('success', False):
                 model_meta = Mlmodelmetadata(
-                    model_name=f"resource_{model_type}_predictor",
-                    model_version=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
-                    model_type="regression",
-                    target_process=model_type,
+                    process_name="_FALLBACK",
+                    resource_type=resource_type,
+                    model_type="gradient_boosting",
                     training_samples=metrics.get('training_samples', 0),
                     accuracy_metrics=json.dumps({
                         'test_r2': float(metrics.get('test_r2', 0)),
                         'test_rmse': float(metrics.get('test_rmse', 0)),
                         'test_mae': float(metrics.get('test_mae', 0)),
                         'cv_r2_mean': float(metrics.get('cv_r2_mean', 0)),
+                        'feature_importance': metrics.get('feature_importance', {}),
                     }),
-                    model_artifact_path=f"/code/models/{model_type}_model.joblib"
+                    model_artifact_path=f"/code/models/_fallback_{resource_type}.pkl",
+                    is_fallback_model=True
                 )
                 session.add(model_meta)
         
         session.commit()
         
+        # Prepare summary
+        trained_count = sum(
+            1 for p in training_results.get('per_process', {}).values()
+            if p.get('status') == 'trained'
+        )
+        fallback_count = training_results['summary'].get('processes_using_fallback', 0)
+        
+        # Return summary only (full results too large)
+        summary_response = {
+            'total_processes': training_results['summary'].get('total_processes', 0),
+            'processes_with_models': training_results['summary'].get('processes_with_models', 0),
+            'processes_using_fallback': training_results['summary'].get('processes_using_fallback', 0),
+        }
+        
+        # Sample of trained processes
+        sample_processes = []
+        for name, result in list(training_results.get('per_process', {}).items())[:10]:
+            if result.get('status') == 'trained':
+                sample_processes.append({
+                    'name': name,
+                    'samples': result.get('samples', 0),
+                    'models': list(result.get('models', {}).keys())
+                })
+        
         return {
             "success": True,
-            "message": f"Trained {len([m for m in training_results.values() if m.get('success')])} models",
+            "message": f"Trained {trained_count} per-process models, {fallback_count} using fallback",
             "training_samples": len(df),
-            "feature_statistics": convert_numpy_types({k: v for k, v in stats.items() if k != 'process_distribution'}),
-            "model_results": convert_numpy_types(training_results)
+            "summary": summary_response,
+            "sample_processes": sample_processes,
+            "fallback_models": {
+                k: {
+                    'test_r2': v.get('test_r2', 0),
+                    'test_rmse': v.get('test_rmse', 0),
+                    'training_samples': v.get('training_samples', 0)
+                }
+                for k, v in training_results.get('fallback', {}).items()
+                if v.get('success')
+            }
         }
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e),
@@ -607,7 +676,7 @@ def retrain_ml_models(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Manually retrain ML models with new data.
+    Manually retrain per-process ML models with new data.
     
     Args:
         institute_id: Optional institute to train on (None = all institutes)
@@ -615,9 +684,10 @@ def retrain_ml_models(
     """
     try:
         from ml.features import extract_process_features, get_feature_statistics
-        from ml.models import train_all_models
+        from ml.models import ResourcePredictor
+        from nfcore_modules import normalize_module_name
         
-        print(f"Retraining ML models...")
+        print(f"Retraining per-process ML models...")
         
         # Extract features from database
         df = extract_process_features(session, institute_id)
@@ -631,42 +701,72 @@ def retrain_ml_models(
         
         print(f"Extracted {len(df)} process records for training")
         
+        # Normalize module names
+        df['module_name'] = df['process_name'].apply(normalize_module_name)
+        
         # Get feature statistics
         stats = get_feature_statistics(df)
         
-        # Train models
-        training_results = train_all_models(df)
+        # Train per-process models
+        predictor = ResourcePredictor()
+        training_results = predictor.train_all_process_models(df, institute_id)
         
-        # Clear existing model metadata and register new ones
-        existing_models = session.exec(select(Mlmodelmetadata).where(Mlmodelmetadata.model_name.like("resource_%"))).all()
+        # Clear existing model metadata
+        existing_models = session.exec(select(Mlmodelmetadata)).all()
         for model in existing_models:
             session.delete(model)
         
-        for model_type, metrics in training_results.items():
+        # Register per-process models
+        for process_name, process_results in training_results.get('per_process', {}).items():
+            if process_results.get('status') == 'trained':
+                for resource_type, metrics in process_results.get('models', {}).items():
+                    if metrics.get('success', False):
+                        model_meta = Mlmodelmetadata(
+                            process_name=process_name,
+                            resource_type=resource_type,
+                            model_type="gradient_boosting",
+                            training_samples=metrics.get('training_samples', 0),
+                            accuracy_metrics=json.dumps({
+                                'test_r2': float(metrics.get('test_r2', 0)),
+                                'test_rmse': float(metrics.get('test_rmse', 0)),
+                                'cv_r2_mean': float(metrics.get('cv_r2_mean', 0)),
+                            }),
+                            model_artifact_path=f"/code/models/{process_name}_{resource_type}.pkl",
+                            is_fallback_model=False
+                        )
+                        session.add(model_meta)
+        
+        # Register fallback models
+        for resource_type, metrics in training_results.get('fallback', {}).items():
             if metrics.get('success', False):
                 model_meta = Mlmodelmetadata(
-                    model_name=f"resource_{model_type}_predictor",
-                    model_version=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),
-                    model_type="regression",
-                    target_process=model_type,
+                    process_name="_FALLBACK",
+                    resource_type=resource_type,
+                    model_type="gradient_boosting",
                     training_samples=metrics.get('training_samples', 0),
                     accuracy_metrics=json.dumps({
                         'test_r2': float(metrics.get('test_r2', 0)),
                         'test_rmse': float(metrics.get('test_rmse', 0)),
-                        'test_mae': float(metrics.get('test_mae', 0)),
                         'cv_r2_mean': float(metrics.get('cv_r2_mean', 0)),
                     }),
-                    model_artifact_path=f"/code/models/{model_type}_model.joblib"
+                    model_artifact_path=f"/code/models/_fallback_{resource_type}.pkl",
+                    is_fallback_model=True
                 )
                 session.add(model_meta)
         
         session.commit()
         
+        trained_count = sum(
+            1 for p in training_results.get('per_process', {}).values()
+            if p.get('status') == 'trained'
+        )
+        fallback_count = training_results['summary'].get('processes_using_fallback', 0)
+        
         return {
             "success": True,
-            "message": f"Retrained {len([m for m in training_results.values() if m.get('success')])} models",
+            "message": f"Retrained {trained_count} per-process models, {fallback_count} using fallback",
             "training_samples": len(df),
-            "training_stats": training_results.get('training_stats', {}),
+            "summary": training_results.get('summary', {}),
             "model_results": convert_numpy_types(training_results)
         }
         
@@ -680,29 +780,21 @@ def retrain_ml_models(
         }
 
 
-def extract_module_name(process_name: str) -> str:
+def extract_module_name(process_name: str, nfcore_cache: Optional[Dict] = None) -> str:
     """
-    Extract clean module name from process name.
+    Extract clean module name from process name using nf-core normalization.
     
     Examples:
         NFCORE:...:TABIX_BGZIPTABIX_GT (test12) -> TABIX_BGZIPTABIX_GT
-        NFCORE:...:BCFTOOLS_FILTER_QUERY_FP (test1) -> BCFTOOLS_FILTER_QUERY_FP
+        NFCORE:...:BCFTOOLS_FILTER_QUERY_FP (test1) -> BCFTOOLS_FILTER
         NFCORE:...:BCFTOOLS_NORM (test1) -> BCFTOOLS_NORM
+    
+    Args:
+        process_name: Full process name from Nextflow
+        nfcore_cache: Optional pre-loaded nf-core module cache
     """
-    # Remove the (instance) part
-    base = process_name.split(' (')[0] if ' (' in process_name else process_name
-    # Get the module name (last part after colon)
-    if ':' in base:
-        module = base.split(':')[-1]
-    else:
-        module = base
-    
-    # Only remove numeric instance suffixes like _1, _2
-    # Keep descriptive suffixes like _FILTER, _QUERY, _FP, _TP, etc.
-    if module.endswith('_1') or module.endswith('_2'):
-        module = module[:-2]
-    
-    return module
+    from nfcore_modules import normalize_module_name
+    return normalize_module_name(process_name, nfcore_cache)
 
 
 def get_extrapolation_warning(extrapolation_factor: float, training_stats: Dict) -> Optional[str]:
@@ -927,11 +1019,6 @@ def predict_resources(
             'io_total': safe_mean([r.get('read_char') for r in rows]) + safe_mean([r.get('write_char') for r in rows]),
             'io_ratio': 1.0,
             'cpu_mem_product': 1.0,
-            'energy_per_sec': 0.0,
-            'co2_per_mb': 0.0,
-            'process_base': rows[0]['process_name'].split(':')[-1].split()[0] if rows and rows[0].get('process_name') else 'unknown',
-            'institute_encoded': {'UNKNOWN': 0, 'LOCAL': 1, 'NONE': 2, 'DKFZ': 3, 'EMBL': 4}.get(rows[0].get('institute_id', 'UNKNOWN'), 0),
-            'cpu_encoded': 0,
             'disk_usage_mb': safe_mean([r.get('disk_usage_mb') for r in rows]) or 1.0,
             'size_category_encoded': 1.0,
             'memory_per_gb': 1.0,
@@ -1215,6 +1302,7 @@ def get_all_optimizations(
         # Load trained ML models
         try:
             from ml.models import ResourcePredictor
+            from nfcore_modules import normalize_module_name, get_nfcore_modules
         except ImportError as e:
             return {
                 "success": False,
@@ -1222,16 +1310,11 @@ def get_all_optimizations(
                 "message": "ML module not properly installed"
             }
         
-        predictor = ResourcePredictor()
-        predictor.load_models()
+        # Load nf-core module cache
+        nfcore_cache = get_nfcore_modules()
         
-        # Check if models are loaded
-        if not any(predictor.models.values()):
-            return {
-                "success": False,
-                "error": "No trained models available",
-                "message": "Train models first using POST /ml/train"
-            }
+        predictor = ResourcePredictor()
+        # Models are loaded on-demand, no need to pre-check
         
         import numpy as np
         
@@ -1268,6 +1351,8 @@ def get_all_optimizations(
                     p.institute_id,
                     p.read_char,
                     p.write_char,
+                    p.read_bytes,
+                    p.write_bytes,
                     p.realtime
                 FROM processexecution p
                 WHERE (UPPER(SPLIT_PART(p.process_name, ' (', 1)) LIKE UPPER(:process_name)
@@ -1290,106 +1375,122 @@ def get_all_optimizations(
                 valid = [v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))]
                 return float(np.mean(valid)) if valid else 0.0
             
-            # Build base feature vector from historical averages
-            avg_features = {
-                'cpus_requested': safe_mean([r.get('cpus_requested') for r in rows]) or 1.0,
-                'time_requested': safe_mean([r.get('time_requested') for r in rows]) or 0.0,
-                'storage_requested': 0.0,
-                'memory_requested': safe_mean([r.get('memory_requested') for r in rows]) or 0.0,
-                'realtime': safe_mean([r.get('realtime') for r in rows]) or 0.0,
-                'percent_cpu': safe_mean([r.get('percent_cpu') for r in rows]) or 0.0,
-                'percent_memory': safe_mean([r.get('percent_memory') for r in rows]) or 0.0,
-                'peak_rss': safe_mean([r.get('peak_rss') for r in rows]) or 0.0,
-                'peak_vmem': safe_mean([r.get('peak_vmem') for r in rows]) or 0.0,
-                'read_char': safe_mean([r.get('read_char') for r in rows]) or 0.0,
-                'write_char': safe_mean([r.get('write_char') for r in rows]) or 0.0,
-                'duration': safe_mean([r.get('duration') for r in rows]) or 0.0,
-                'has_module': 1 if ':' in (rows[0]['process_name'] if rows else '') else 0,
-                'cpu_utilization': safe_mean([r.get('percent_cpu') for r in rows]) / 100.0,
-                'memory_utilization': safe_mean([r.get('percent_memory') for r in rows]) / 100.0,
-                'memory_requested_mb': safe_mean([r.get('memory_requested') for r in rows]) or 1.0,
-                'memory_efficiency': 1.0,
-                'time_efficiency': 1.0,
-                'io_total': safe_mean([r.get('read_char') for r in rows]) + safe_mean([r.get('write_char') for r in rows]),
-                'io_ratio': 1.0,
-                'cpu_mem_product': 1.0,
-                'energy_per_sec': 0.0,
-                'co2_per_mb': 0.0,
-                'process_base': rows[0]['process_name'].split(':')[-1].split()[0] if rows and rows[0].get('process_name') else 'unknown',
-                'institute_encoded': {'UNKNOWN': 0, 'LOCAL': 1, 'NONE': 2, 'DKFZ': 3, 'EMBL': 4}.get(rows[0].get('institute_id', 'UNKNOWN'), 0),
-                'cpu_encoded': 0,
-                'disk_usage_mb': safe_mean([r.get('disk_usage_mb') for r in rows]) or 1.0,
-                'size_category_encoded': 1.0,
-                'memory_per_gb': 1.0,
-                'time_per_gb': 1.0,
-                'cpu_per_gb': 1.0,
-            }
+            # Calculate historical medians for ALL data size features
+            median_disk = safe_mean([r.get('disk_usage_mb') for r in rows]) or 1.0
+            median_read_char = safe_mean([r.get('read_char', 0) or 0 for r in rows])
+            median_write_char = safe_mean([r.get('write_char', 0) or 0 for r in rows])
             
             # Get disk size percentiles for scaling
             disk_values = [r['disk_usage_mb'] for r in rows if r.get('disk_usage_mb') and r['disk_usage_mb'] > 0]
-            if not disk_values:
-                disk_values = [1.0]
             
-            disk_p10 = float(np.percentile(disk_values, 10))
-            disk_p50 = float(np.percentile(disk_values, 50))
-            disk_p90 = float(np.percentile(disk_values, 90))
-            
-            # Get base CPU prediction from ML model
-            base_cpu_pred = predictor.predict(avg_features, 'cpu')
-            
-            # Calculate per-GB usage from historical data
-            resource_per_gb = []
-            for r in rows:
-                if r.get('disk_usage_mb') and r['disk_usage_mb'] > 0:
-                    disk_gb = r['disk_usage_mb'] / 1000.0
-                    resource_per_gb.append({
-                        'memory_per_gb': (r.get('peak_rss', 0) or 0) / disk_gb,
-                        'time_per_gb': (r.get('duration', 0) or 0) / disk_gb,
-                        'cpu': r.get('cpus_requested', 1) or 1
-                    })
-            
-            if resource_per_gb:
-                median_memory_per_gb = float(np.median([x['memory_per_gb'] for x in resource_per_gb]))
-                median_time_per_gb = float(np.median([x['time_per_gb'] for x in resource_per_gb]))
-                median_cpu = float(np.median([x['cpu'] for x in resource_per_gb]))
-            else:
-                median_memory_per_gb = 100.0
-                median_time_per_gb = 10.0
-                median_cpu = 1.0
-            
-            # Build scenarios with proper scaling
+            # Check if we have enough data variation for scenarios
             scenarios_response = {}
-            size_scenarios = [
-                ('SMALL', disk_p10),
-                ('MEDIUM', disk_p50),
-                ('LARGE', disk_p90)
-            ]
+            scenario_warnings = {}
+            
+            if len(disk_values) >= 10:
+                # Enough samples - generate all 3 scenarios
+                disk_p10 = float(np.percentile(disk_values, 10))
+                disk_p50 = float(np.percentile(disk_values, 50))
+                disk_p90 = float(np.percentile(disk_values, 90))
+                
+                size_scenarios = [
+                    ('SMALL', disk_p10),
+                    ('MEDIUM', disk_p50),
+                    ('LARGE', disk_p90)
+                ]
+                
+                # Check if sizes are meaningfully different (at least 20% variation)
+                size_variation = (disk_p90 - disk_p10) / max(disk_p50, 0.001)
+                if size_variation < 0.2:
+                    # Not enough variation - only show MEDIUM
+                    size_scenarios = [('MEDIUM', disk_p50)]
+                    scenario_warnings['size_variation'] = f"Insufficient size variation in historical data (all runs similar size). Only MEDIUM scenario shown."
+            elif len(disk_values) >= 3:
+                # Few samples - only show MEDIUM (median)
+                disk_p50 = float(np.percentile(disk_values, 50)) if disk_values else median_disk
+                size_scenarios = [('MEDIUM', disk_p50)]
+                scenario_warnings['sample_count'] = f"Only {len(disk_values)} historical runs. Only MEDIUM scenario shown with median size."
+            else:
+                # Too few samples - skip ML predictions, use historical averages
+                size_scenarios = [('MEDIUM', median_disk)]
+                scenario_warnings['insufficient_data'] = f"Only {len(disk_values)} historical runs. Using historical averages instead of ML predictions."
             
             for size_name, disk_mb in size_scenarios:
-                disk_gb = max(disk_mb / 1000.0, 0.001)
+                # Calculate scaling factor relative to historical median
+                scale_factor = disk_mb / max(median_disk, 0.001)
                 
-                # Scale memory and time based on disk size
-                memory_mb = median_memory_per_gb * disk_gb
-                time_sec = median_time_per_gb * disk_gb
+                # Build feature vector for this scenario - scale ALL data size features
+                # IMPORTANT: Use EXACT feature names that model was trained with
+                # For PER-PROCESS models: NO process_base (each model is process-specific)
+                scenario_features = {
+                    # Process identity
+                    'has_module': 1 if ':' in (rows[0]['process_name'] if rows else '') else 0,
+                    
+                    # Data size features (ALL scaled proportionally)
+                    'disk_intensity': disk_mb,
+                    'disk_io_total': (median_read_char + median_write_char) * scale_factor,
+                    'disk_io_ratio': median_read_char / (median_write_char + 0.001),
+                    
+                    # Utilization metrics
+                    'cpu_utilization': safe_mean([r.get('percent_cpu') for r in rows]) / 100.0,
+                    'memory_utilization': safe_mean([r.get('percent_memory') for r in rows]) / 100.0,
+                    
+                    # Legacy I/O features (scaled) - model expects these
+                    'io_total': (median_read_char + median_write_char) * scale_factor,
+                    'io_ratio': 1.0,
+                    
+                    # Interaction features
+                    'cpu_mem_product': safe_mean([r.get('percent_cpu') for r in rows]) * safe_mean([r.get('peak_rss') for r in rows]),
+                    
+                    # Size category encoding
+                    'size_category_encoded': 0.0 if size_name == 'SMALL' else (1.0 if size_name == 'MEDIUM' else 2.0),
+                    
+                    # Per-GB features (scale with size) - these are what CPU model SHOULD use
+                    'memory_per_gb': (safe_mean([r.get('peak_rss') for r in rows]) / max(median_disk / 1000, 0.001)) * scale_factor,
+                    'time_per_gb': (safe_mean([r.get('duration') for r in rows]) / max(median_disk / 1000, 0.001)) * scale_factor,
+                    'cpu_per_gb': (safe_mean([r.get('percent_cpu') for r in rows]) / 100.0 / max(median_disk / 1000, 0.001)) * scale_factor,
+                }
                 
-                # Apply safety margins
-                memory_with_safety = memory_mb * 1.2
-                time_with_safety = time_sec * 1.3
-                time_with_safety = max(3600, time_with_safety)
+                # Get ML predictions for this scenario using per-process model
+                memory_pred = predictor.predict_for_process(module_name, scenario_features, 'memory')
+                time_pred = predictor.predict_for_process(module_name, scenario_features, 'time')
+                cpu_pred = predictor.predict_for_process(module_name, scenario_features, 'cpu')
                 
-                # Get CPU from ML or median
-                cpu_value = int(round(median_cpu))
-                if base_cpu_pred.get('success'):
-                    ml_cpu = int(round(base_cpu_pred['prediction']))
-                    cpu_value = max(1, min(16, ml_cpu))
+                # Track if fallback model was used
+                is_fallback = memory_pred.get('is_fallback_model', False)
+                
+                # Extract predictions with safety margins
+                if memory_pred.get('success'):
+                    memory_mb = memory_pred.get('prediction_with_safety', memory_pred['prediction'] * 1.2)
+                else:
+                    memory_mb = 256.0  # Fallback
+                    is_fallback = True
+                
+                if time_pred.get('success'):
+                    time_sec = time_pred.get('prediction_with_safety', time_pred['prediction'] * 1.3)
+                    time_sec = max(3600, time_sec)  # Minimum 1 hour
+                else:
+                    time_sec = 7200  # Fallback 2 hours
+                    is_fallback = True
+                
+                if cpu_pred.get('success'):
+                    cpu_value = max(1, min(32, int(round(cpu_pred['prediction']))))
+                else:
+                    cpu_value = 2  # Fallback
+                    is_fallback = True
                 
                 scenarios_response[size_name] = {
                     'cpus': cpu_value,
-                    'memory': format_memory(memory_with_safety),
-                    'time': round_time(time_with_safety),
+                    'is_fallback_model': is_fallback,
+                    'memory': format_memory(memory_mb),
+                    'time': round_time(time_sec),
                     'disk_size_mb': round(disk_mb, 1)
                 }
             
+            # Add warnings if any scenarios were skipped
+            if scenario_warnings:
+                scenarios_response['_warnings'] = scenario_warnings
+                
             optimization = {
                 "module_name": module_name,
                 "historical_samples": len(rows),

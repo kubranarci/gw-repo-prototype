@@ -15,14 +15,11 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
     Extract features from process execution data for ML training.
     
     Features include:
-    - Process name (one-hot encoded)
-    - Input/output file counts (from BCO provenance)
+    - Process name
     - Requested resources (CPUs, memory, time, disk)
     - Actual usage (peak RSS, peak VMEM, CPU%, memory%)
-    - I/O metrics (read/write chars)
-    - CO2/energy data (if available)
-    - Hardware info (CPU model)
-    - Institute ID
+    - I/O metrics (read/write chars, disk bytes)
+    - Size category encoding
     """
     
     # Build query for process executions
@@ -51,14 +48,9 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
         p.peak_rss_mb,
         p.institute_id,
         w.run_name,
-        w.nextflow_version,
-        c.energy_consumption_mwh,
-        c.co2e_mg,
-        c.cpu_model,
-        c.powerdraw_cpu_w
+        w.nextflow_version
     FROM processexecution p
     LEFT JOIN workflowexecution w ON p.workflow_execution_id = w.id
-    LEFT JOIN co2footprint c ON p.id = c.process_execution_id
     """
     
     if institute_id:
@@ -100,25 +92,25 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
     df['io_total'] = df['read_char'] + df['write_char']
     df['io_ratio'] = df['read_char'] / (df['write_char'] + 1)
     
-    # 3b. Disk I/O intensity (from work directory scanning)
-    df['disk_io_total'] = df['read_bytes'].fillna(0) + df['write_bytes'].fillna(0)
-    df['disk_io_ratio'] = df['read_bytes'].fillna(0) / (df['write_bytes'].fillna(0) + 1)
-    df['disk_intensity'] = df['disk_usage_mb'].fillna(0)
+    # 3b. Disk I/O intensity (from work directory scanning) - Convert to MB
+    # Overwrite with MB values (original bytes values not needed after this)
+    df['read_bytes'] = df['read_bytes'].fillna(0) / (1024 * 1024)  # Now in MB
+    df['write_bytes'] = df['write_bytes'].fillna(0) / (1024 * 1024)  # Now in MB
+    df['disk_io_total'] = df['read_bytes'] + df['write_bytes']  # MB
+    df['disk_io_ratio'] = df['read_bytes'] / (df['write_bytes'] + 0.001)
+    df['disk_intensity'] = df['disk_usage_mb'].fillna(0)  # MB
+    
+    # 3c. Trace I/O (from Nextflow trace files) - Convert to MB
+    # Overwrite with MB values
+    df['read_char'] = df['read_char'].fillna(0) / (1024 * 1024)  # Now in MB
+    df['write_char'] = df['write_char'].fillna(0) / (1024 * 1024)  # Now in MB
+    df['io_total'] = df['read_char'] + df['write_char']  # MB (model expects this)
+    df['io_ratio'] = df['read_char'] / (df['write_char'] + 0.001)
     
     # 4. CPU-Memory correlation
     df['cpu_mem_product'] = df['percent_cpu'] * df['peak_rss']
     
-    # 5. Energy efficiency (if CO2 data available)
-    if 'energy_consumption_mwh' in df.columns:
-        df['energy_per_sec'] = df['energy_consumption_mwh'] / df['duration'].replace(0, np.nan)
-        df['co2_per_mb'] = df['co2e_mg'] / df['peak_rss'].replace(0, np.nan)
-    
-    # 6. Institute encoding
-    if 'institute_id' in df.columns:
-        institute_mapping = {inst: idx for idx, inst in enumerate(df['institute_id'].dropna().unique())}
-        df['institute_encoded'] = df['institute_id'].map(institute_mapping).fillna(-1).astype(float)
-    
-    # 7. Size category encoding (for multi-scenario predictions)
+    # 5. Size category encoding (for multi-scenario predictions)
     if 'data_size_tag' in df.columns:
         # Use the tag if available
         size_mapping = {'small': 0, 'medium': 1, 'large': 2, 'mixed': 1}
@@ -141,11 +133,6 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
             
             df['size_category_encoded'] = df['disk_usage_mb'].apply(categorize_size)
     
-    # 7. CPU model encoding
-    if 'cpu_model' in df.columns:
-        cpu_mapping = {cpu: idx for idx, cpu in enumerate(df['cpu_model'].dropna().unique())}
-        df['cpu_encoded'] = df['cpu_model'].map(cpu_mapping).fillna(-1).astype(float)
-    
     # ==================== Target Variables ====================
     
     # Memory prediction target (MB)
@@ -155,38 +142,21 @@ def extract_process_features(session: Session, institute_id: Optional[str] = Non
     df['target_duration_sec'] = df['duration']
     
     # CPU prediction target (number of cores)
-    # Strategy: Calculate optimal CPU based on per-core utilization
-    # - per_core_util = percent_cpu / cpus_requested
-    # - If <50%: Over-allocated → reduce
-    # - If >90%: Under-allocated → increase
-    # - If 50-90%: Optimal → keep
+    # Use RAW percent_cpu interpretation: percent_cpu / 100 = actual CPU cores used
+    # Add 10% buffer for optimal allocation
     def estimate_cpus(row):
         percent_cpu = row['percent_cpu'] if pd.notna(row['percent_cpu']) else 0
-        cpus_requested = row['cpus_requested'] if pd.notna(row['cpus_requested']) else 0
         
-        if percent_cpu > 0 and cpus_requested > 0:
-            per_core_util = percent_cpu / cpus_requested
+        if percent_cpu > 0:
+            # RAW CPU cores used (cumulative across all cores)
             actual_cores_used = percent_cpu / 100.0
-            
-            if per_core_util < 50:
-                # Over-allocated (e.g., 4 CPU requested, 200% used = 2 cores needed)
-                optimal_cpus = max(1, int(np.ceil(actual_cores_used)))
-            elif per_core_util > 90:
-                # Under-allocated (e.g., 1 CPU requested, 150% used = 2 cores needed)
-                optimal_cpus = max(1, int(np.ceil(actual_cores_used)) + 1)
-            else:
-                # Optimal 50-90% per-core utilization
-                optimal_cpus = max(1, int(np.ceil(actual_cores_used)))
-            
-            return min(16, optimal_cpus)
-        elif percent_cpu > 0:
-            # No requested data, use actual usage
-            return min(16, max(1, int(np.ceil(percent_cpu / 100))))
-        elif cpus_requested > 0:
-            # Fallback to requested
-            return cpus_requested
+            # Add 10% buffer and round up
+            optimal_cpus = int(np.ceil(actual_cores_used * 1.1))
+            return max(1, min(32, optimal_cpus))
         else:
-            return 1
+            # Fallback to requested if available
+            cpus_requested = row['cpus_requested'] if pd.notna(row['cpus_requested']) else 1
+            return max(1, min(32, int(cpus_requested)))
     
     df['target_cpus'] = df.apply(estimate_cpus, axis=1)
     
@@ -209,45 +179,43 @@ def prepare_training_data(df: pd.DataFrame, target: str = 'target_memory_mb') ->
         feature_names: List of feature column names
     """
     
-    # Select features for training
+    # Select features for training - EXACT match with what model expects
+    # (NO process_base - model was trained without process identity)
+    # ALL models use SAME features for simplicity
     feature_columns = [
-        'process_base',
         'has_module',
+        
+        # Data size features (ALL in MB)
+        'disk_intensity',           # disk_usage_mb
+        'disk_io_total',            # read_bytes + write_bytes (work dir)
+        'disk_io_ratio',            # read_bytes / write_bytes
+        
+        # Utilization metrics
         'cpu_utilization',
         'memory_utilization',
-        'io_total',
-        'io_ratio',
-        'disk_io_total',
-        'disk_io_ratio',
-        'disk_intensity',
+        
+        # I/O features (trace files, in MB)
+        'io_total',                 # read_char + write_char
+        'io_ratio',                 # read_char / write_char
+        
+        # Interaction features
         'cpu_mem_product',
-        'institute_encoded',
-        'cpu_encoded',
-        'size_category_encoded',  # NEW: for multi-scenario predictions
+        
+        # Size category encoding
+        'size_category_encoded',
+        
+        # Per-GB normalization (for extrapolation)
+        'memory_per_gb',
+        'time_per_gb',
+        'cpu_per_gb',
     ]
-    
-    # Add per-GB normalization features (for extrapolation)
-    if 'memory_per_gb' in df.columns:
-        feature_columns.append('memory_per_gb')
-    
-    if 'time_per_gb' in df.columns:
-        feature_columns.append('time_per_gb')
-    
-    if 'cpu_per_gb' in df.columns:
-        feature_columns.append('cpu_per_gb')
-    
-    # Add CO2 features if available
-    if 'energy_per_sec' in df.columns:
-        feature_columns.append('energy_per_sec')
-    
-    if 'co2_per_mb' in df.columns:
-        feature_columns.append('co2_per_mb')
     
     # Filter to rows with valid target
     df_clean = df[df[target].notna()].copy()
     
-    # Define categorical columns
-    categorical_cols = ['process_base']
+    # For PER-PROCESS models: Don't include process_base as a feature
+    # Each model is already specific to one process
+    # (Global fallback model would need process_base, but we're not using it there either)
     
     # Convert feature columns to numeric (EXPLICIT selection)
     for col in feature_columns:
@@ -257,18 +225,12 @@ def prepare_training_data(df: pd.DataFrame, target: str = 'target_memory_mb') ->
             # Feature not available, create as zeros
             df_clean[col] = 0
     
-    # One-hot encoding for categorical features
-    df_encoded = pd.get_dummies(df_clean, columns=categorical_cols, drop_first=True)
-    
-    # Get final feature columns (from our explicit list + one-hot encoded categoricals)
-    feature_cols_final = [c for c in df_encoded.columns if c in feature_columns or c.startswith('process_base_')]
-    
     # Ensure all features are numeric
-    X = df_encoded[feature_cols_final].apply(pd.to_numeric, errors='coerce').fillna(0)
+    X = df_clean[feature_columns].apply(pd.to_numeric, errors='coerce').fillna(0)
     X = X.replace([np.inf, -np.inf], 0)
     y = pd.to_numeric(df_clean[target], errors='coerce').fillna(0)
     
-    return X, y, feature_cols_final
+    return X, y, feature_columns
 
 
 def get_feature_statistics(df: pd.DataFrame) -> Dict:

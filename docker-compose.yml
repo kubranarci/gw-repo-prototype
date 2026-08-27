@@ -16,7 +16,7 @@ services:
       - "80:80"
 
   db:
-    image: postgres
+    image: postgres:15
     restart: always
     shm_size: 1024mb
     volumes:

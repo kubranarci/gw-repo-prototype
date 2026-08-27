@@ -1,18 +1,27 @@
-# gw-repo-prototype
-An API prototype for storing provenance and resource usage information from Nextflow workflow executions, equipped with a Streamlit analytics dashboard and ML-based resource optimization.
+# GW-RePO: Workflow Resource Profiler & Optimizer
 
+Track Nextflow workflow resource usage and get ML-powered recommendations for local execution.
+
+## Quick Start
+
+```bash
+./setup.sh
+docker compose up -d
+```
+
+## Architecture
 
 ```
 [ Nextflow Pipeline Execution ]
        │
-       ├─────────────────────────┬─────────────────────────┬─────────────────────────┐
-       ▼                         ▼                         ▼                         ▼
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│     work     │         │ co2footprint │         │   bco.json   │         │  trace.txt   │
-│  directory   │         │  (trace/sum) │         │              │         │              │
-└──────────────┘         └──────────────┘         └──────────────┘         └──────────────┘
-       │                         │                         │                         │
-       └─────────────────────────┴────────────┬────────────┴─────────────────────────┘
+       ├─────────────────────────┬─────────────────────────┬
+       ▼                         ▼                         ▼                       
+┌──────────────┐         ┌──────────────┐         ┌──────────────┐   
+│     work     │         │   bco.json   │         │  trace.txt   │ 
+│  directory   │         │  (optional)  │         │  (required)  │ 
+└──────────────┘         └──────────────┘         └──────────────┘   
+       │                         │                         │
+       └─────────────────────────┴────────────┬────────────┘
                                               ▼
                                  [ ETL Script and API Client ]
                                               │
@@ -37,355 +46,282 @@ An API prototype for storing provenance and resource usage information from Next
 │                     └───────────────────┘                      │
 └────────────────────────────────────────────────────────────────┘
 ```
-## Documentation
 
-- 📖 [Technical Documentation](doc/TECHNICAL_DOCS.md) - CPU recommendations, work directory scanning, API endpoints, troubleshooting
-- 📝 [Changelog](CHANGELOG.md) - Recent changes and version history
+**Data Sources:**
+- **work directory** - Disk usage, I/O bytes (via `--work-dir` scan)
+- **bco.json** - Provenance data, input/output files (optional)
+- **trace.txt** - Process metrics: CPU, memory, duration, I/O (required)
 
-## Quick Start
+**Components:**
+- **GW RePO API** - FastAPI backend (port 80)
+- **PostgreSQL Database** - Workflow execution data (port 5432)
+- **ML Resource Models** - Gradient Boosting predictors
+- **Streamlit UI App** - Analytics dashboard (port 8501)
 
-```bash
-./setup.sh
-docker compose up -d
-```
+**Runs entirely on your machine:**
+- ✅ Private: All data stays local
+- ✅ Self-contained: Docker containers only
+- ✅ Works offline
 
-The `setup.sh` script will:
-- Generate a secure API key automatically
-- Create the consolidated `.env` configuration file
-- Initialize the database schema
+## Submit Workflow Data
 
-## Deployment Model
+### 1. Configure Nextflow
 
-**Each user runs their own isolated GW-Repo instance:**
-
-```
-Your Machine
-└── Docker Compose
-    ├── API Container (port 80)
-    ├── PostgreSQL Database (port 5432) ← Your private database
-    └── Streamlit Dashboard (port 8501)
-```
-
-**Key Points**:
-- ✅ **Private**: Your workflow data stays on your machine
-- ✅ **Isolated**: No sharing with other users
-- ✅ **Self-contained**: Everything runs in Docker containers
-- ✅ **Your data**: PostgreSQL database is yours alone
-- ✅ **Your models**: ML models train only on YOUR workflow data
-
-**Why this design?**
-- Genomic workflow data is often sensitive
-- Different institutes have different hardware (recommendations are environment-specific)
-- Simple deployment: no central service to maintain
-- Works offline, no internet required after setup
-
-## Data Persistence
-
-**Data is stored permanently** in a PostgreSQL Docker volume and persists across:
-- `docker compose down` / `docker compose up -d`
-- Container restarts
-- System reboots
-
-**Storage location**: `/var/lib/docker/volumes/gw-repo-db-data`
-
-**To delete all data:**
-```bash
-docker compose down -v  # Removes the database volume
-rm .env                 # Optional: remove configuration
-```
-
-**To view stored data:**
-```bash
-docker compose exec db psql -U postgres -d gw_repo -c "\dt"  # List tables
-docker compose exec db psql -U postgres -d gw_repo -c "SELECT COUNT(*) FROM workflowexecution;"  # Count workflows
-```
-
-**Backup your data:**
-```bash
-# Manual backup
-docker compose exec db pg_dump -U postgres gw_repo > backup-$(date +%Y%m%d).sql
-
-# Restore from backup
-docker compose exec db psql -U postgres -d gw_repo < backup-20260821.sql
-```
-
-## Client Requirements & Setup
-
-Install Python dependencies:
-
-```bash
-pip install typer requests python-dotenv streamlit plotly pandas
-```
-
-### Nextflow Configuration
-
-**Manual Configuration**: Enable process trace, nf-prov, and nf-co2footprint plugins in your `nextflow.config`:
+Add to `nextflow.config`:
 
 ```groovy
-plugins {
-    id 'nf-prov'             // Provenance tracking (required)
-    id 'nf-co2footprint'     // CO2 emission tracking (recommended)
-}
-
-prov {
-    enabled = true
-    formats {
-        bco {
-            file = "bco-${new Date().format('yyyyMMdd')}-${System.nanoTime().toString().take(8)}.json"
-        }
-    }
-}
-
 trace {
     enabled = true
-    fields = 'hash,process,name,status,exit,module,container,attempt,submit,start,complete,duration,cpus,time,disk,memory,realtime,queue,%cpu,%mem,peak_rss,peak_vmem,rchar,wchar'
-}
-
-co2footprint {
-    trace {
-        file = "./pipeline_info/co2footprint_trace-${new Date().format('yyyyMMdd')}.txt"
-    }
+    fields = 'hash,process,name,status,duration,cpus,time,disk,memory,realtime,%cpu,%mem,peak_rss,peak_vmem,rchar,wchar'
 }
 ```
 
-Run your SLURM, LSF or local workflows as usual. Ensure the pipeline metadata (trace, bco, and co2footprint files) is generated in the target execution directory.
-
-### Client Environment Configuration
-
-The root `.env` file (created by `setup.sh`) contains all required variables. Export it before running the client:
+### 2. Run Client
 
 ```bash
-export $(cat .env | xargs)
+export API_KEY=<your-key-from-.env>
+python client/client.py <pipeline_info_dir> --work-dir <work_dir>
 ```
 
-#### Institute ID (IMPORTANT)
+### 3. What Gets Extracted
 
-Set `INSTITUTE_ID` to tag your workflow data. This enables **environment-specific recommendations**:
+**From execution trace (`execution_trace_*.txt`):**
+- `process_name` - Full process identifier
+- `duration` - Actual runtime (seconds)
+- `cpus_requested` - Requested CPU cores
+- `memory_requested` - Requested memory
+- `time_requested` - Requested time limit
+- `disk_requested` - Requested disk space
+- `percent_cpu` - Actual CPU utilization (%)
+- `percent_memory` - Actual memory utilization (%)
+- `peak_rss` - Peak resident memory (MB)
+- `peak_vmem` - Peak virtual memory (MB)
+- `rchar` - Characters read (bytes)
+- `wchar` - Characters written (bytes)
+- `realtime` - Wall clock time
 
-```bash
-export INSTITUTE_ID=DKFZ    # DKFZ cluster
-```
+**From work directory scanning (`--work-dir`):**
+- `disk_usage_mb` - Total disk space used by task (MB)
+- `read_bytes` - Bytes read from disk during execution
+- `write_bytes` - Bytes written to disk during execution
+- `peak_vmem_mb` - Peak virtual memory from procfs (MB)
+- `peak_rss_mb` - Peak resident memory from procfs (MB)
 
-**Why this matters**: ML models train separately for each institute, so recommendations are tailored to your specific hardware and environment.
+**From BCO provenance (`manifest_*.bco.json`):** *(optional)*
+- Input file paths and hashes
+- Output file paths and hashes
+- Parameter inputs
+- Workflow structure
 
-**Valid values**: Any string (e.g., `DKFZ`, `EMBL`, `LOCAL`, `NONE`, `UNKNOWN`, or custom institute names)
+**Privacy:** File paths are stored for provenance only. ML models use numerical metrics only.
 
-## Submitting Execution Data
-
-The client script processes entire output directories containing execution trace, BCO, and CO2 footprint files.
-
-Run the client to parse the metadata and submit it to the PostgreSQL database via the REST API:
-
-```bash
-export API_KEY=your_api_key_here
-python client/client.py <path_to_pipeline_info_directory> [--work-dir <path_to_work_directory>] [--api-key <your_api_key>]
-```
-
-**Parameters:**
-* `<path_to_pipeline_info_directory>`: Path to the directory containing:
-  - `execution_trace_*.txt` (required)
-  - `manifest_*.bco.json` (optional, provenance data)
-  - `co2footprint_trace_*.txt` (optional, CO2 per-process data)
-  - `co2footprint_summary_*.txt` (optional, CO2 workflow summary)
-* `--work-dir`: Path to Nextflow work directory for disk usage scanning (optional)
-* `--api-key`: API key for authentication (optional if `API_KEY` is set in environment)
-
-When `--work-dir` is provided, the client automatically scans the work directory to extract additional metrics:
-
-**Extracted Metrics**:
-- `disk_usage_mb`: Total disk space used by task (MB)
-- `read_bytes`: Bytes read from disk
-- `write_bytes`: Bytes written to disk
-- `peak_vmem_mb`: Peak virtual memory (MB)
-- `peak_rss_mb`: Peak resident memory (MB)
-
-**Note**: The scanner NEVER stores file paths, filenames, or sample names - only numerical values.
-
-**Example Output**:
-```
-Found 1 workflow runs to process. Institute: DKFZ
-
---- Processing Run: 2026-08-20_14-47-55 ---
-  ✓ Workflow submitted
-  Scanning work directory for 145 tasks...
-  ✓ Scanned 145 tasks
-  ✓ Submitted 145 processes with disk metrics
-```
-
-## Visualization Dashboard
-
-To inspect the resource allocations, I/O bottlenecks, and completion times of your workflows, launch the Streamlit analytics interface:
+## View Dashboard
 
 ```bash
 streamlit run ui/app.py
 ```
 
-Open http://localhost:8501 in your browser.
+Open http://localhost:8501
 
-The dashboard provides 5 pages:
+### Dashboard Pages
 
-### Dashboard
-- Process resource utilization charts (CPU, memory, duration, I/O)
+#### 1. Dashboard
+
+Enables quick overview of all workflow executions and, find resource-heavy processes
+
+- Process resource utilization charts (CPU%, memory%, duration)
 - Filter by process name
-- Generate optimized Nextflow config based on historical averages
-- Download detailed process data tables
+- Historical execution table with all metrics
+- Generate optimized Nextflow config based on historical P95 values
+- Download detailed process data as CSV
 
-### ML Training
-- Train Gradient Boosting models for memory, time, and CPU prediction
-- Filter training data by institute
-- View model performance metrics (R², RMSE, MAE)
-- Analyze feature importance rankings
+---
 
-### ML Predictions
-- Get resource predictions for any process by name
-- Includes P95 safety margins for production use
-- Auto-generates Nextflow config snippets
-- Download ready-to-use configuration files
+#### 2. Analytics
 
-### Optimization
-- Data-driven recommendations based on historical executions
-- Statistical analysis (mean, median, P95, max) for memory, duration, CPU, energy, and CO2
-- Process insights (e.g., "CPU-bound", "I/O-bound")
-- Recommended configuration with safety margins
+Helps to understand resource patterns per process and identification of bottlenecks
 
-### Model Performance
-- Monitor all trained models and their accuracy metrics
-- Compare model performance across different targets
-- View feature importance visualizations
-- Track model training history and artifacts
+- Select process from dropdown
+- Correlation plots:
+  - Memory vs Disk Size (with R² correlation)
+  - CPU Cores Used vs Disk Size
+  - Duration vs Disk Size
+  - Data Read/Written vs Disk Size
+  - Memory vs I/O intensity
+- Process classification:
+  - **Memory-Heavy**: Memory/Disk ratio > 10×
+  - **Disk-Heavy**: Memory/Disk ratio < 0.5×
+  - **I/O-Intensive**: I/O intensity > 5×
+  - **Compute-Intensive**: I/O intensity < 0.5×
+- Toggle log scale for better visualization
 
-## ML Features
 
-The system includes machine learning capabilities for resource prediction and optimization:
+---
 
-### Institute & Pipeline-Based Recommendations
+#### 3. ML Training
 
-**Key Concept**: Recommendations are **specific to your environment** (institute + pipeline).
+Train resource prediction models here
 
+- Train Gradient Boosting models on your historical data
+- View model performance metrics:
+  - R² score (variance explained)
+  - RMSE (root mean square error)
+  - MAE (mean absolute error)
+  - Cross-validation scores
+- Feature importance rankings (which features matter most)
+- Model artifacts stored in `/code/models/`
+
+**Requirements:** Minimum 10 samples per process for per-process models
+
+---
+
+#### 4. ML Predictions
+Get resource recommendations for a specific process before running your new analysis
+- Enter process name (e.g., `BCFTOOLS_FILTER`)
+- Get predictions for SMALL, MEDIUM, LARGE dataset scenarios
+- Predictions include:
+  - Memory (MB) with P95 safety margin
+  - CPU cores with P95 safety margin
+  - Duration (seconds) with P95 safety margin
+- Auto-generated Nextflow config snippet
+- Download ready-to-use config file
+- Shows if prediction uses per-process model or fallback
+
+---
+
+#### 5. Optimization
+Get data-driven recommendations for all processes
+
+**Features:**
+- Lists all processes with historical data
+- For each process:
+  - Historical statistics (mean, std, min, max, median, P95, P99)
+  - Recommended configuration (P95-based)
+  - Process insights (CPU-bound, I/O-bound, etc.)
+  - Energy and CO2 analysis (if available)
+  - 3 scenario predictions (SMALL/MEDIUM/LARGE)
+  - `is_fallback_model` flag (true if <10 samples)
+- Filter by institute
+
+---
+
+#### 6. Model Performance
+Monitor trained model quality before trusting predictions
+
+- List all trained models (memory, time, CPU per process)
+- Accuracy metrics comparison
+- Feature importance visualizations
+- Training sample counts
+- Model timestamps
+- Delete/retrain individual models
+
+---
+
+## ML Resource Prediction
+
+### Algorithm
+
+**Model:** Gradient Boosting Regressor (sklearn)
+
+**Why Gradient Boosting:**
+- Handles non-linear relationships (resource usage vs data size)
+- Robust to outliers (some runs are anomalies)
+- Provides feature importance (interpretability)
+- Works well with tabular data (our feature set)
+
+**Training:**
+- 80/20 train/test split
+- 5-fold cross-validation
+- StandardScaler for feature normalization
+- Models saved as `.pkl` files
+
+**Prediction:**
+- P95 safety margin (15% buffer for memory/time)
+- Minimum 1 hour for time predictions
+- CPU rounded to nearest core (1-32 range)
+
+### Features Used (13 total)
+
+| Feature | Description | Why It Matters |
+|---------|-------------|----------------|
+| `has_module` | 1 if process has module prefix | Distinguishes tool vs custom script |
+| `disk_intensity` | Disk usage in MB | Direct measure of data size |
+| `disk_io_total` | Read + write bytes (MB) | I/O volume affects runtime |
+| `disk_io_ratio` | Read/write ratio | Read-heavy vs write-heavy patterns |
+| `cpu_utilization` | CPU % / 100 | How much CPU the process uses |
+| `memory_utilization` | Memory % / 100 | How much memory the process uses |
+| `io_total` | Trace I/O (rchar+wchar in MB) | Nextflow-reported I/O |
+| `io_ratio` | Trace I/O ratio | Read/write pattern from trace |
+| `cpu_mem_product` | CPU × memory correlation | Processes that use both heavily |
+| `size_category_encoded` | 0=small, 1=medium, 2=large | Dataset size category |
+| `memory_per_gb` | Memory efficiency (MB per GB data) | Normalized memory usage |
+| `time_per_gb` | Time efficiency (sec per GB data) | Normalized runtime |
+| `cpu_per_gb` | CPU efficiency (cores per GB data) | Normalized CPU usage |
+
+### Per-Process vs Fallback Models
+
+**Per-process model:** Trained on ≥10 samples of the same process (e.g., `BCFTOOLS_FILTER`)
+
+**Fallback model:** Used when <10 samples, trained on ALL processes combined
+
+**How it works:**
 ```
-Institute (e.g., DKFZ) + Pipeline (e.g., variantbenchmarking)
-       ↓
-Historical executions from YOUR environment
-       ↓
-ML models trained on YOUR data
-       ↓
-Recommendations optimized for YOUR hardware & workflows
+Process has 24 samples? → Use BCFTOOLS_FILTER model ✅
+Process has 3 samples?  → Use fallback model ⚠️
 ```
 
-**Why this matters**:
-- Different institutes have different hardware (CPU models, storage speeds)
-- Different pipelines have different resource patterns
-- Recommendations from DKFZ may not apply to EMBL, and vice versa
+## API Endpoints
 
-**How it works**:
-1. Submit workflow data with `INSTITUTE_ID` set (e.g., `DKFZ`, `EMBL`, `LOCAL`)
-2. ML models train separately for each institute
-3. Recommendations filter by institute automatically
-4. Results are tailored to your specific environment
+### POST /ml/train
+Train models on historical data.
 
-### Model Architecture
-- **Algorithm**: Gradient Boosting Regressor with 5-fold cross-validation
-- **Targets**: Memory (MB), Duration (seconds), CPU utilization (cores)
-- **Features**: 80+ features including resource requests, utilization metrics, I/O ratios, CO2 footprint
-- **Safety Margins**: P95-based recommendations for production deployments
-- **Environment-Specific**: Models trained per-institute for hardware-aware predictions
-
-### Training the Models
-
-Via API:
 ```bash
 curl -X POST http://localhost/ml/train \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"institute_id": "DKFZ"}'
-```
-
-Via UI: Navigate to "ML Training" page and click "Start Training"
-
-**Requirements**: Minimum 100 process executions for reliable predictions (500+ recommended)
-
-### Getting Predictions
-
-Via API:
-```bash
-curl "http://localhost/ml/predict?process_name=BCFTOOLS_SORT" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
-Response:
-```json
-{
-  "success": true,
-  "predictions": {
-    "memory": {"value": 512.5, "unit": "MB", "confidence": 0.7, "safety_margin": 1.15},
-    "time": {"value": 45.2, "unit": "seconds", "confidence": 0.7, "safety_margin": 1.15},
-    "cpu": {"value": 2.1, "unit": "cores", "confidence": 0.7, "safety_margin": 1.15}
-  },
-  "nextflow_config": {
-    "memory": "512 MB",
-    "time": "45s",
-    "cpus": 2
-  }
-}
-```
+### GET /ml/predict
+Get predictions for a process.
 
-### Optimization Recommendations
-
-Via API:
 ```bash
-curl "http://localhost/ml/optimization/BCFTOOLS_SORT?institute_id=DKFZ" \
+curl "http://localhost/ml/predict?process_name=BCFTOOLS_FILTER" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
-Provides:
-- Historical statistics (mean, std, min, max, median, P95, P99)
-- Recommended configuration based on P95 values
-- Process insights (CPU-bound, I/O-bound, memory-efficient, etc.)
-- Energy and CO2 footprint analysis
+### GET /ml/optimizations
+Get all process optimizations.
 
-### Model Metadata
-
-View trained model information:
 ```bash
-curl "http://localhost/ml/models" \
+curl "http://localhost/ml/optimizations" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
-Returns model types, training timestamps, accuracy metrics, and feature importance data.
+## Data Management
 
-### Feature Engineering
+**View data:**
+```bash
+docker compose exec db psql -U postgres -d gw_repo -c "SELECT COUNT(*) FROM processexecution;"
+```
 
-The ML module automatically extracts and engineers features including:
-- **Resource requests**: CPUs, memory, time, storage
-- **Utilization metrics**: CPU %, memory %, efficiency ratios
-- **I/O patterns**: Read/write bytes, I/O ratio
-- **CO2 footprint**: Energy consumption, carbon emissions
-- **Categorical encodings**: Institute, CPU model, process type
-- **Derived features**: CPU-memory product, energy per second, CO2 per MB
+**Backup:**
+```bash
+docker compose exec db pg_dump -U postgres gw_repo > backup.sql
+```
 
-### Institute Support
-
-Models can be trained per-institute for hardware-specific predictions:
-- Set `INSTITUTE_ID` environment variable in client
-- Filter training data by institute
-- Compare resource usage across different hardware infrastructures
+**Reset:**
+```bash
+docker compose down -v  # Deletes all data
+rm .env
+./setup.sh              # Fresh start
+```
 
 ## Configuration
 
-All configuration is in the root `.env` file (auto-generated by `setup.sh`):
+All settings in `.env`:
+- `API_KEY`: Authentication
+- `DATABASE_URL`: PostgreSQL connection
+- `API_BASE_URL`: API endpoint
 
-```bash
-# API Authentication
-API_KEY=<auto-generated-secure-key>
+---
 
-# Database Configuration
-DATABASE_URL=postgresql://postgres:local_dev_pass_123@db/gw_repo
-POSTGRES_PASSWORD=local_dev_pass_123
-POSTGRES_DB=gw_repo
-
-# Client Configuration
-API_BASE_URL=http://localhost:80
-INSTITUTE_ID=DKFZ  # Options: DKFZ, EMBL, LOCAL, NONE, UNKNOWN, or custom institute name
-```
-
-To regenerate the API key, delete `.env` and run `./setup.sh` again.
+**Full documentation**: `doc/README.md`

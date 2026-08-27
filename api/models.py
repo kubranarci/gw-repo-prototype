@@ -68,13 +68,13 @@ class Optimizationrule(SQLModel, table=True):
 
 
 class Mlmodelmetadata(SQLModel, table=True):
-    """Metadata for trained ML models."""
+    """Metadata for trained ML models - per-process models."""
     id: Optional[int] = Field(default=None, primary_key=True)
-    model_name: str
-    model_version: str
-    model_type: str  # "regression", "classification", "clustering"
-    target_process: Optional[str] = None
-    training_samples: int
+    process_name: str  # "BCFTOOLS_FILTER" (nf-core normalized, uppercase)
+    resource_type: str  # "memory", "time", or "cpu"
+    model_type: str  # "gradient_boosting"
+    training_samples: int  # Process-specific sample count
     accuracy_metrics: str  # JSON string with RMSE, MAE, R² etc.
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    model_artifact_path: Optional[str] = None
+    model_artifact_path: str  # "/code/models/BCFTOOLS_FILTER_memory.pkl"
+    is_fallback_model: bool = False  # True for global fallback model

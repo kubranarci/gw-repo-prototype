@@ -1,12 +1,13 @@
 """
-ML models for resource prediction.
-Implements regression models for memory, time, and CPU prediction.
+ML models for resource prediction - PER-PROCESS MODELS.
+
+Each process gets its own model trained on its historical data only.
+Processes with <10 samples use the global fallback model.
 """
 
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Ridge
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
@@ -14,53 +15,56 @@ import joblib
 import json
 import os
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from datetime import datetime, timezone
 
 
 class ResourcePredictor:
     """
-    ML-based resource predictor for Nextflow processes.
-    Trains models to predict memory, time, and CPU requirements.
+    Per-process ML resource predictor.
+    
+    Structure:
+    - self.models[process_name][resource_type] = model
+    - self.models['_fallback'][resource_type] = global fallback model
     """
     
     def __init__(self, model_dir: str = "/code/models"):
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
         
-        self.models = {
-            'memory': None,
-            'time': None,
-            'cpu': None,
-        }
-        self.scalers = {
-            'memory': None,
-            'time': None,
-            'cpu': None,
-        }
-        self.feature_columns = {}
-        self.model_metadata = {}
+        # Per-process models: {process_name: {resource_type: model}}
+        self.models: Dict[str, Dict[str, Optional[GradientBoostingRegressor]]] = {}
+        
+        # Per-process scalers
+        self.scalers: Dict[str, Dict[str, Optional[StandardScaler]]] = {}
+        
+        # Feature columns per process per resource
+        self.feature_columns: Dict[str, Dict[str, List[str]]] = {}
+        
+        # Model metadata per process
+        self.model_metadata: Dict[str, Dict[str, Dict]] = {}
     
-    def train_model(
-        self, 
-        X: pd.DataFrame, 
-        y: pd.Series, 
-        model_type: str = 'memory',
-        model_name: str = 'gradient_boosting'
+    def train_process_model(
+        self,
+        process_name: str,
+        X: pd.DataFrame,
+        y: pd.Series,
+        resource_type: str,
+        model_path: str
     ) -> Dict:
         """
-        Train a prediction model for a specific resource type.
+        Train a model for a specific process and resource type.
         
         Args:
+            process_name: Normalized process name (e.g., "BCFTOOLS_FILTER")
             X: Feature matrix
             y: Target variable
-            model_type: 'memory', 'time', or 'cpu'
-            model_name: 'gradient_boosting', 'random_forest', or 'ridge'
+            resource_type: 'memory', 'time', or 'cpu'
+            model_path: Path to save model
         
         Returns:
             Dictionary with training metrics
         """
-        
         # Remove rows with invalid targets
         valid_mask = y.notna() & (y > 0)
         X_valid = X[valid_mask].copy()
@@ -82,27 +86,13 @@ class ResourcePredictor:
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
-        # Select model
-        if model_name == 'gradient_boosting':
-            model = GradientBoostingRegressor(
-                n_estimators=100,
-                max_depth=5,
-                learning_rate=0.1,
-                random_state=42
-            )
-        elif model_name == 'random_forest':
-            model = RandomForestRegressor(
-                n_estimators=100,
-                max_depth=10,
-                random_state=42,
-                n_jobs=-1
-            )
-        elif model_name == 'ridge':
-            model = Ridge(alpha=1.0)
-        else:
-            raise ValueError(f"Unknown model: {model_name}")
-        
         # Train model
+        model = GradientBoostingRegressor(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            random_state=42
+        )
         model.fit(X_train_scaled, y_train)
         
         # Evaluate
@@ -114,374 +104,261 @@ class ResourcePredictor:
         
         # Calculate metrics
         metrics = {
-            'model_type': model_type,
-            'model_name': model_name,
+            'process_name': process_name,
+            'resource_type': resource_type,
             'training_samples': len(X_train),
             'test_samples': len(X_test),
-            'train_rmse': np.sqrt(mean_squared_error(y_train, y_pred_train)),
-            'train_mae': mean_absolute_error(y_train, y_pred_train),
-            'train_r2': r2_score(y_train, y_pred_train),
-            'test_rmse': np.sqrt(mean_squared_error(y_test, y_pred_test)),
-            'test_mae': mean_absolute_error(y_test, y_pred_test),
-            'test_r2': r2_score(y_test, y_pred_test),
-            'cv_r2_mean': cv_scores.mean(),
-            'cv_r2_std': cv_scores.std(),
+            'train_rmse': float(np.sqrt(mean_squared_error(y_train, y_pred_train))),
+            'train_mae': float(mean_absolute_error(y_train, y_pred_train)),
+            'train_r2': float(r2_score(y_train, y_pred_train)),
+            'test_rmse': float(np.sqrt(mean_squared_error(y_test, y_pred_test))),
+            'test_mae': float(mean_absolute_error(y_test, y_pred_test)),
+            'test_r2': float(r2_score(y_test, y_pred_test)),
+            'cv_r2_mean': float(cv_scores.mean()),
+            'cv_r2_std': float(cv_scores.std()),
             'feature_importance': dict(zip(
-                X.columns, 
-                model.feature_importances_.tolist() if hasattr(model, 'feature_importances_') else [0] * len(X.columns)
+                X.columns,
+                model.feature_importances_.tolist()
             )),
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'success': True,
         }
         
-        # Store model and scaler
-        self.models[model_type] = model
-        self.scalers[model_type] = scaler
-        self.feature_columns[model_type] = X.columns.tolist()
-        self.model_metadata[model_type] = metrics
+        # Save model and scaler
+        joblib.dump(model, model_path)
+        joblib.dump(scaler, model_path.replace('.pkl', '_scaler.pkl'))
         
         return metrics
     
-    def _calculate_confidence(
-        self, 
-        feature_df: pd.DataFrame, 
-        model_type: str,
-        prediction: float
-    ) -> float:
-        """
-        Calculate confidence score for a prediction based on:
-        1. Model's historical performance (R², CV scores)
-        2. Training sample count
-        3. Feature validity (no missing/zero features)
-        
-        Returns: Confidence score between 0.0 and 1.0
-        """
-        confidence = 0.5  # Base confidence
-        
-        # Factor 1: Model performance (R² score)
-        metadata = self.model_metadata.get(model_type, {})
-        if metadata.get('success'):
-            r2 = metadata.get('test_r2', 0)
-            cv_r2 = metadata.get('cv_r2_mean', 0)
-            
-            # R² contribution (up to 0.3 points)
-            # R² > 0.8: +0.3, R² > 0.6: +0.2, R² > 0.4: +0.1
-            if r2 > 0.8:
-                confidence += 0.3
-            elif r2 > 0.6:
-                confidence += 0.2
-            elif r2 > 0.4:
-                confidence += 0.1
-            
-            # CV consistency (up to 0.1 points)
-            # Low std dev means model is stable
-            cv_std = metadata.get('cv_r2_std', 1.0)
-            if cv_std < 0.05:
-                confidence += 0.1
-            elif cv_std < 0.1:
-                confidence += 0.05
-        
-        # Factor 2: Training sample count (up to 0.2 points)
-        training_samples = metadata.get('training_samples', 0)
-        if training_samples >= 500:
-            confidence += 0.2
-        elif training_samples >= 100:
-            confidence += 0.15
-        elif training_samples >= 50:
-            confidence += 0.1
-        elif training_samples >= 10:
-            confidence += 0.05
-        
-        # Factor 3: Feature validity (up to 0.1 points)
-        # Check if features have reasonable values (not all zeros/NaN)
-        feature_valid_ratio = (feature_df != 0).mean().mean() if not feature_df.empty else 0
-        if feature_valid_ratio > 0.8:
-            confidence += 0.1
-        elif feature_valid_ratio > 0.5:
-            confidence += 0.05
-        
-        # Cap confidence at 1.0
-        return min(1.0, confidence)
-    
-    def predict(
-        self, 
-        features: Dict, 
-        model_type: str = 'memory',
-        confidence: bool = True
+    def train_all_process_models(
+        self,
+        df: pd.DataFrame,
+        institute_id: Optional[str] = None
     ) -> Dict:
         """
-        Predict resource requirements for a process.
+        Train per-process models for all processes in the dataset.
         
         Args:
-            features: Dictionary of feature values
-            model_type: 'memory', 'time', or 'cpu'
-            confidence: Whether to calculate confidence interval
+            df: DataFrame with all process data
+            institute_id: Optional filter by institute
         
         Returns:
-            Dictionary with prediction and confidence interval
+            Dictionary with training results for all processes
         """
+        from .features import prepare_training_data
         
-        if self.models[model_type] is None:
+        results = {
+            'per_process': {},
+            'fallback': {},
+            'summary': {
+                'total_processes': 0,
+                'processes_with_models': 0,
+                'processes_using_fallback': 0,
+            }
+        }
+        
+        # Filter by institute if specified
+        if institute_id:
+            df = df[df['institute_id'] == institute_id].copy()
+        
+        # Group by normalized process name
+        grouped = df.groupby('module_name')
+        results['summary']['total_processes'] = len(grouped)
+        
+        # Train per-process models
+        for process_name, group_df in grouped:
+            if len(group_df) < 10:
+                # Not enough samples - will use fallback
+                results['per_process'][process_name] = {
+                    'status': 'fallback',
+                    'samples': len(group_df),
+                    'reason': 'Insufficient samples (<10)'
+                }
+                results['summary']['processes_using_fallback'] += 1
+                continue
+            
+            results['per_process'][process_name] = {
+                'status': 'trained',
+                'samples': len(group_df),
+                'models': {}
+            }
+            
+            # Train models for each resource type
+            for resource_type, target_col in [
+                ('memory', 'target_memory_mb'),
+                ('time', 'target_duration_sec'),
+                ('cpu', 'target_cpus')
+            ]:
+                try:
+                    X, y, feature_cols = prepare_training_data(group_df, target_col)
+                    
+                    if len(X) < 10:
+                        continue
+                    
+                    model_path = str(self.model_dir / f"{process_name}_{resource_type}.pkl")
+                    metrics = self.train_process_model(
+                        process_name, X, y, resource_type, model_path
+                    )
+                    
+                    if metrics.get('success'):
+                        # Store feature columns for this process/resource
+                        if process_name not in self.feature_columns:
+                            self.feature_columns[process_name] = {}
+                        self.feature_columns[process_name][resource_type] = feature_cols
+                        
+                        results['per_process'][process_name]['models'][resource_type] = metrics
+                        results['summary']['processes_with_models'] += 1
+                        
+                except Exception as e:
+                    results['per_process'][process_name]['models'][resource_type] = {
+                        'error': str(e),
+                        'success': False
+                    }
+        
+        # Train global fallback model on ALL data
+        print("Training global fallback model on all data...")
+        for resource_type, target_col in [
+            ('memory', 'target_memory_mb'),
+            ('time', 'target_duration_sec'),
+            ('cpu', 'target_cpus')
+        ]:
+            try:
+                X, y, feature_cols = prepare_training_data(df, target_col)
+                
+                if len(X) >= 10:
+                    model_path = str(self.model_dir / f"_fallback_{resource_type}.pkl")
+                    metrics = self.train_process_model(
+                        '_fallback', X, y, resource_type, model_path
+                    )
+                    
+                    if metrics.get('success'):
+                        self.feature_columns['_fallback'][resource_type] = feature_cols
+                        results['fallback'][resource_type] = metrics
+                        
+            except Exception as e:
+                results['fallback'][resource_type] = {
+                    'error': str(e),
+                    'success': False
+                }
+        
+        return results
+    
+    def load_process_model(
+        self,
+        process_name: str,
+        resource_type: str
+    ) -> Tuple[Optional[GradientBoostingRegressor], Optional[StandardScaler], Optional[List[str]]]:
+        """
+        Load a model for a specific process and resource type.
+        
+        Returns:
+            Tuple of (model, scaler, feature_columns) or (None, None, None) if not found
+        """
+        # Check if already loaded
+        if process_name in self.models and resource_type in self.models[process_name]:
+            return (
+                self.models[process_name][resource_type],
+                self.scalers[process_name][resource_type],
+                self.feature_columns.get(process_name, {}).get(resource_type)
+            )
+        
+        # Load from disk
+        model_path = self.model_dir / f"{process_name}_{resource_type}.pkl"
+        scaler_path = self.model_dir / f"{process_name}_{resource_type}_scaler.pkl"
+        
+        if not model_path.exists() or not scaler_path.exists():
+            return None, None, None
+        
+        try:
+            model = joblib.load(model_path)
+            scaler = joblib.load(scaler_path)
+            
+            # Load feature columns from metadata file if exists
+            feature_cols = None
+            meta_path = self.model_dir / f"{process_name}_{resource_type}_meta.json"
+            if meta_path.exists():
+                with open(meta_path, 'r') as f:
+                    meta = json.load(f)
+                    feature_cols = meta.get('feature_columns')
+            
+            # Cache in memory
+            if process_name not in self.models:
+                self.models[process_name] = {}
+                self.scalers[process_name] = {}
+            
+            self.models[process_name][resource_type] = model
+            self.scalers[process_name][resource_type] = scaler
+            if feature_cols:
+                self.feature_columns[process_name][resource_type] = feature_cols
+            
+            return model, scaler, feature_cols
+            
+        except Exception as e:
+            print(f"Error loading model {model_path}: {e}")
+            return None, None, None
+    
+    def predict_for_process(
+        self,
+        process_name: str,
+        features: Dict,
+        resource_type: str
+    ) -> Dict:
+        """
+        Predict resource requirements for a specific process.
+        
+        Tries per-process model first, falls back to global model if not available.
+        
+        Args:
+            process_name: Normalized process name
+            features: Feature dictionary
+            resource_type: 'memory', 'time', or 'cpu'
+        
+        Returns:
+            Prediction result dictionary
+        """
+        # Try per-process model first
+        model, scaler, feature_cols = self.load_process_model(process_name, resource_type)
+        is_fallback = False
+        
+        # Fall back to global model if per-process not available
+        if model is None:
+            model, scaler, feature_cols = self.load_process_model('_fallback', resource_type)
+            is_fallback = True
+        
+        if model is None or scaler is None:
             return {
-                'error': f'Model not trained for {model_type}',
-                'success': False
+                'error': f'No model available for {process_name} {resource_type}',
+                'success': False,
+                'is_fallback': False
             }
         
         # Convert features to DataFrame
         feature_df = pd.DataFrame([features])
         
         # Ensure all expected columns are present
-        expected_cols = self.feature_columns.get(model_type, [])
-        for col in expected_cols:
-            if col not in feature_df.columns:
-                feature_df[col] = 0
-        
-        # Reorder columns to match training
-        feature_df = feature_df[expected_cols]
+        if feature_cols:
+            for col in feature_cols:
+                if col not in feature_df.columns:
+                    feature_df[col] = 0
+            feature_df = feature_df[feature_cols]
         
         # Scale features
-        scaler = self.scalers[model_type]
         feature_scaled = scaler.transform(feature_df)
         
         # Predict
-        model = self.models[model_type]
         prediction = model.predict(feature_scaled)[0]
         
-        # Calculate confidence score based on multiple factors
-        confidence_score = self._calculate_confidence(
-            feature_df, model_type, prediction
-        )
-        
-        # Apply safety margin based on confidence
-        # Lower confidence → higher safety margin
-        # High confidence (0.8+): 15% margin
-        # Medium confidence (0.5-0.8): 30% margin  
-        # Low confidence (<0.5): 50% margin
-        if confidence_score >= 0.8:
-            safety_margin = 1.15
-        elif confidence_score >= 0.5:
-            safety_margin = 1.30
-        else:
-            safety_margin = 1.50
+        # Calculate safety margin (15% for per-process, 30% for fallback)
+        safety_margin = 1.15 if not is_fallback else 1.30
         
         result = {
             'prediction': float(prediction),
             'prediction_with_safety': float(prediction * safety_margin),
             'safety_margin': safety_margin,
-            'confidence': confidence_score,
-            'confidence_level': 'high' if confidence_score >= 0.8 else ('medium' if confidence_score >= 0.5 else 'low'),
-            'model_version': self.model_metadata.get(model_type, {}).get('timestamp', 'unknown'),
+            'is_fallback_model': is_fallback,
+            'process_name': process_name,
+            'resource_type': resource_type,
             'success': True
         }
         
-        # Add confidence interval if requested
-        if confidence and 'test_rmse' in self.model_metadata.get(model_type, {}):
-            rmse = self.model_metadata[model_type]['test_rmse']
-            result['confidence_interval'] = {
-                'lower': float(max(0, prediction - 1.96 * rmse)),
-                'upper': float(prediction + 1.96 * rmse),
-                'confidence_level': 0.95
-            }
-        
         return result
-    
-    def predict_for_all_sizes(self, base_features: Dict, training_stats: Dict) -> Dict:
-        """
-        Generate predictions for small, medium, and large dataset scenarios.
-        
-        Args:
-            base_features: Base feature dictionary (without size-specific values)
-            training_stats: Statistics from training data (percentiles, etc.)
-        
-        Returns:
-            Dictionary with predictions for all 3 size scenarios
-        """
-        results = {}
-        
-        # Get size percentiles from training stats
-        disk_p25 = training_stats.get('disk_mb_p25', 1.0)
-        disk_p50 = training_stats.get('disk_mb_p50', 10.0)
-        disk_p75 = training_stats.get('disk_mb_p75', 50.0)
-        disk_max = training_stats.get('disk_mb_max', 100.0)
-        
-        # Define 3 scenarios
-        scenarios = {
-            'small': {
-                'disk_mb': disk_p25,
-                'size_encoded': 0.0
-            },
-            'medium': {
-                'disk_mb': disk_p50,
-                'size_encoded': 1.0
-            },
-            'large': {
-                'disk_mb': disk_p75,
-                'size_encoded': 2.0
-            }
-        }
-        
-        for size_name, size_params in scenarios.items():
-            # Create feature vector for this size scenario
-            features = base_features.copy()
-            
-            # Set size-specific features
-            features['disk_usage_mb'] = size_params['disk_mb']
-            features['size_category_encoded'] = size_params['size_encoded']
-            
-            # Scale per-GB features by target size
-            # (model learned per-GB usage, now scale to target size)
-            target_gb = size_params['disk_mb'] / 1000.0
-            if 'memory_per_gb' in base_features:
-                features['memory_per_gb'] = base_features.get('memory_per_gb', 0) * target_gb
-            if 'time_per_gb' in base_features:
-                features['time_per_gb'] = base_features.get('time_per_gb', 0) * target_gb
-            if 'cpu_per_gb' in base_features:
-                features['cpu_per_gb'] = base_features.get('cpu_per_gb', 0) * target_gb
-            
-            # Get predictions for this scenario
-            scenario_preds = {}
-            for resource_type in ['memory', 'time', 'cpu']:
-                pred_result = self.predict(features, resource_type)
-                if pred_result.get('success'):
-                    scenario_preds[resource_type] = pred_result
-            
-            if scenario_preds:
-                results[size_name] = {
-                    'predictions': scenario_preds,
-                    'disk_size_mb': size_params['disk_mb'],
-                    'extrapolation_factor': size_params['disk_mb'] / max(disk_max, 1)
-                }
-        
-        return results
-    
-    def save_models(self, training_stats: Dict = None):
-        """Save trained models and training statistics to disk."""
-        for model_type in ['memory', 'time', 'cpu']:
-            if self.models[model_type] is not None:
-                model_path = self.model_dir / f"{model_type}_model.joblib"
-                scaler_path = self.model_dir / f"{model_type}_scaler.joblib"
-                metadata_path = self.model_dir / f"{model_type}_metadata.json"
-                features_path = self.model_dir / f"{model_type}_features.json"
-                
-                joblib.dump(self.models[model_type], model_path)
-                joblib.dump(self.scalers[model_type], scaler_path)
-                
-                with open(metadata_path, 'w') as f:
-                    json.dump(self.model_metadata.get(model_type, {}), f, indent=2)
-                
-                with open(features_path, 'w') as f:
-                    json.dump(self.feature_columns.get(model_type, []), f, indent=2)
-        
-        # Save training statistics for multi-scenario predictions
-        if training_stats:
-            stats_path = self.model_dir / "training_stats.json"
-            with open(stats_path, 'w') as f:
-                json.dump(training_stats, f, indent=2)
-            print(f"✓ Saved training statistics to {stats_path}")
-    
-    def load_models(self):
-        """Load trained models and training statistics from disk."""
-        for model_type in ['memory', 'time', 'cpu']:
-            model_path = self.model_dir / f"{model_type}_model.joblib"
-            scaler_path = self.model_dir / f"{model_type}_scaler.joblib"
-            metadata_path = self.model_dir / f"{model_type}_metadata.json"
-            features_path = self.model_dir / f"{model_type}_features.json"
-            
-            if model_path.exists():
-                self.models[model_type] = joblib.load(model_path)
-                self.scalers[model_type] = joblib.load(scaler_path)
-                
-                with open(metadata_path, 'r') as f:
-                    self.model_metadata[model_type] = json.load(f)
-                
-                with open(features_path, 'r') as f:
-                    self.feature_columns[model_type] = json.load(f)
-                
-                print(f"✓ Loaded {model_type} model")
-            else:
-                print(f"⚠ No {model_type} model found")
-        
-        # Load training statistics
-        stats_path = self.model_dir / "training_stats.json"
-        if stats_path.exists():
-            with open(stats_path, 'r') as f:
-                self.training_stats = json.load(f)
-            print(f"✓ Loaded training statistics")
-        else:
-            self.training_stats = {}
-            print(f"⚠ No training statistics found")
-
-
-def train_all_models(df: pd.DataFrame, model_dir: str = "/code/models") -> Dict:
-    """
-    Train all resource prediction models with multi-scenario support.
-    
-    Args:
-        df: DataFrame with features and targets
-        model_dir: Directory to save models
-    
-    Returns:
-        Dictionary with training results for all models
-    """
-    
-    from ml.features import prepare_training_data
-    
-    predictor = ResourcePredictor(model_dir=model_dir)
-    results = {}
-    
-    # Calculate training statistics for multi-scenario predictions
-    print("📊 Calculating training statistics...")
-    training_stats = {
-        'run_count': len(df),
-        'disk_mb_min': float(df['disk_usage_mb'].min()) if 'disk_usage_mb' in df else 0,
-        'disk_mb_max': float(df['disk_usage_mb'].max()) if 'disk_usage_mb' in df else 0,
-        'disk_mb_p25': float(df['disk_usage_mb'].quantile(0.25)) if 'disk_usage_mb' in df else 1.0,
-        'disk_mb_p50': float(df['disk_usage_mb'].median()) if 'disk_usage_mb' in df else 10.0,
-        'disk_mb_p75': float(df['disk_usage_mb'].quantile(0.75)) if 'disk_usage_mb' in df else 50.0,
-        'duration_p50': float(df['duration'].median()) if 'duration' in df else 3600,
-    }
-    print(f"   Runs: {training_stats['run_count']}")
-    print(f"   Disk range: {training_stats['disk_mb_min']:.2f} - {training_stats['disk_mb_max']:.2f} MB")
-    print(f"   Duration median: {training_stats['duration_p50']:.1f}s")
-    
-    # Train memory model
-    print("Training memory prediction model...")
-    X_mem, y_mem, features_mem = prepare_training_data(df, 'target_memory_mb')
-    if len(X_mem) > 10:
-        metrics_mem = predictor.train_model(X_mem, y_mem, 'memory')
-        results['memory'] = metrics_mem
-        print(f"  ✓ Memory model R²: {metrics_mem.get('test_r2', 0):.3f}")
-    else:
-        results['memory'] = {'error': 'Insufficient data', 'success': False}
-        print(f"  ✗ Insufficient data for memory model")
-    
-    # Train time model
-    print("Training time prediction model...")
-    X_time, y_time, features_time = prepare_training_data(df, 'target_duration_sec')
-    if len(X_time) > 10:
-        metrics_time = predictor.train_model(X_time, y_time, 'time')
-        results['time'] = metrics_time
-        print(f"  ✓ Time model R²: {metrics_time.get('test_r2', 0):.3f}")
-    else:
-        results['time'] = {'error': 'Insufficient data', 'success': False}
-        print(f"  ✗ Insufficient data for time model")
-    
-    # Train CPU model
-    print("Training CPU prediction model...")
-    X_cpu, y_cpu, features_cpu = prepare_training_data(df, 'target_cpus')
-    if len(X_cpu) > 10:
-        metrics_cpu = predictor.train_model(X_cpu, y_cpu, 'cpu')
-        results['cpu'] = metrics_cpu
-        print(f"  ✓ CPU model R²: {metrics_cpu.get('test_r2', 0):.3f}")
-    else:
-        results['cpu'] = {'error': 'Insufficient data', 'success': False}
-        print(f"  ✗ Insufficient data for CPU model")
-    
-    # Save models with training statistics
-    predictor.save_models(training_stats=training_stats)
-    print(f"✓ Models saved to {model_dir}")
-    
-    # Add training stats to results
-    results['training_stats'] = training_stats
-    
-    return results

@@ -2,9 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /code
 
-# Install streamlit, plotly, requests, pandas, and python-dotenv directly 
-# without needing heavy database compilation tools in the UI container
-RUN pip install --no-cache-dir streamlit plotly requests pandas python-dotenv
+# Install streamlit, plotly, requests, pandas, python-dotenv, scipy, and statsmodels for statistics
+RUN pip install --no-cache-dir streamlit plotly requests pandas python-dotenv scipy statsmodels
 
 COPY . .
 
