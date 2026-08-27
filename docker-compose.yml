@@ -9,30 +9,44 @@ services:
       db:
         condition: service_started
     env_file:
-      - ./api/.env
+      - ./.env
     networks:
       - gw-repo-network
     ports:
       - "80:80"
+
   db:
-    image: postgres
+    image: postgres:15
     restart: always
-    # set shared memory limit when using docker-compose
     shm_size: 1024mb
-    # or set shared memory limit when deploy via swarm stack
-    #volumes:
-    #  - ./db/prov-init.sql:/docker-entrypoint-initdb.d/init.sql
-    #  - type: tmpfs
-    #    target: /dev/shm
-    #    tmpfs:
-    #      size: 134217728 # 128*2^20 bytes = 128Mb
-    env_file:
-      - ./db/.env
+    volumes:
+      - gw-repo-db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
     ports:
       - "5432:5432"  
+    networks:
+      - gw-repo-network
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    restart: always
+    ports:
+      - "8501:8501"
+    env_file:
+      - ./.env
+    environment:
+      - API_BASE_URL=http://api
+    depends_on:
+      - api
     networks:
       - gw-repo-network
 
 networks:
   gw-repo-network:
 
+volumes:
+  gw-repo-db-data:

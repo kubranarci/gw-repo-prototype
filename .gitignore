@@ -1,0 +1,40 @@
+# Streamlit agent skills (environment-specific symlinks)
+.agents/skills/developing-with-streamlit/*
+.agents/skills/*
+.agents/*
+
+# Environment files
+client/.env
+api/.env
+db/.env
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# ML model artifacts (generated during training)
+api/models/
+*.joblib
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

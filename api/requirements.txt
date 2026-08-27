@@ -4,3 +4,7 @@ sqlalchemy
 psycopg2
 xxhash
 sqlmodel
+python-dateutil
+numpy
+pandas
+scikit-learn
