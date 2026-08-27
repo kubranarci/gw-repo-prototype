@@ -46,9 +46,7 @@ def parse_command_trace(trace_file: Path) -> dict:
 
 def get_disk_usage_safe(task_dir: Path) -> dict:
     """
-    Get TOTAL disk usage for a task directory.
-    Returns ONLY size in MB - NO filenames, NO paths.
-    
+    Get TOTAL disk usage for a task directory.    
     Privacy-safe: Only returns a number (MB).
     
     Args:

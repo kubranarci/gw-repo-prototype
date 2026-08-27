@@ -26,8 +26,8 @@ with st.sidebar:
     )
 
 def render_resource_charts(df: pd.DataFrame):
-    st.title("📊 Dashboard - Workflow Metrics")
-    st.write("View **historical execution data** from your submitted workflows.")
+    st.title("📊 Dashboard - Execution Metrics")
+    st.write("View **historical execution data** from your submitted workflow.")
     
     # ============================================
     # DETAILED DATA TABLE - ALL RUNS
@@ -323,49 +323,12 @@ def fetch_process_data(api_key_val):
 def normalize_process_name(name):
     """
     Normalize process name using nfcore_modules.py logic.
-    Fetches official nf-core modules from GitHub API with caching.
+    Uses nf-core.cache file for official module names.
     """
     import sys
     sys.path.append('api')
-    try:
-        from nfcore_modules import normalize_module_name
-        return normalize_module_name(name)
-    except ImportError:
-        pass
-    
-    # Fallback: same logic inline (for when API module unavailable)
-    if not isinstance(name, str):
-        return str(name)
-    
-    base = name.split(' (')[0] if ' (' in name else name
-    if ':' in base:
-        module = base.split(':')[-1]
-    else:
-        module = base
-    module = module.upper()
-    parts = module.split('_')
-    
-    # Common nf-core tools fallback
-    KNOWN_TOOLS = {
-        'HAPPY', 'TABIX', 'BCFTOOLS', 'RTGTOOLS', 'TRUVARI', 'PICARD',
-        'MULTIQC', 'BEDTOOLS', 'SAMTOOLS', 'GATK', 'GATK4', 'BWA',
-        'BOWTIE2', 'STAR', 'HISAT2', 'SALMON', 'KALLISTO', 'FASTQC',
-        'TRIMGALORE', 'TRIMMOMATIC', 'CUTADAPT', 'MINIMAP2', 'MACS2',
-        'DESEQ2', 'EDGER', 'LIMMA', 'STRINGTIE', 'RSEM', 'CELLRANGER',
-        'SEURAT', 'SCANPY', 'KRAKEN2', 'KRONA', 'METAPHLAN', 'HUMANN3',
-        'PROKKA', 'ROARY', 'SPADES', 'MEGAHIT', 'FLYE', 'CANU', 'MEDAKA',
-        'RACON', 'PORECHOP', 'NANOPLOT', 'BUSCO', 'QUAST', 'CHECKM',
-        'MANTA', 'DELLY', 'SVIM', 'SVDB', 'LUMPY', 'SURVIVOR', 'PLINK',
-        'PLINK2', 'HTSLIB', 'MARKDUPLICATES', 'QUALIMAP', 'PRESEQ',
-        'DATAVZRD', 'AARDVARK', 'SVANALYZER', 'UCSC', 'GNU',
-    }
-    
-    if parts and parts[0] in KNOWN_TOOLS and len(parts) >= 2:
-        return f'{parts[0]}_{parts[1]}'
-    
-    return module
-    
-    return module
+    from nfcore_modules import normalize_module_name
+    return normalize_module_name(name)
 
 
 def render_analytics():
@@ -445,11 +408,7 @@ def render_analytics():
     df_valid['mem_disk_ratio'] = df_valid['peak_rss'] / (df_valid['disk_usage_mb'] + 0.001)
     df_valid['io_intensity'] = df_valid['io_total_mb'] / (df_valid['disk_usage_mb'] + 0.001)
     
-    # Show how many original process variants were merged
-    original_names = df_process['short_name'].unique()
-    variant_info = f" ({len(original_names)} variant{'s' if len(original_names) > 1 else ''})" if len(original_names) > 1 else ""
-    
-    st.info(f"Showing {len(df_valid)} runs for **{selected_process}{variant_info}**")
+    st.info(f"Showing {len(df_valid)} runs for **{selected_process}**")
     
     # User options
     col_opt1, col_opt2 = st.columns(2)
@@ -463,7 +422,7 @@ def render_analytics():
     # ============================================
     # PLOT 1: Memory (peak_rss) vs Disk Size
     # ============================================
-    st.subheader(f"📊 Memory vs Disk Size - {selected_process}{variant_info}")
+    st.subheader(f"📊 Memory vs Disk Size - {selected_process}")
     
     fig_mem = px.scatter(
         df_valid,
@@ -496,7 +455,7 @@ def render_analytics():
     # ============================================
     # PLOT 2: Actual CPU Cores Used vs Disk Size
     # ============================================
-    st.subheader(f"💻 Actual CPU Cores Used vs Disk Size - {selected_process}{variant_info}")
+    st.subheader(f"💻 Actual CPU Cores Used vs Disk Size - {selected_process}")
     st.write("*Calculated as: percent_cpu / 100 (RAW CPU usage across all cores)*")
     
     fig_cpu = px.scatter(
@@ -530,7 +489,7 @@ def render_analytics():
     # ============================================
     # PLOT 3: Duration vs Disk Size
     # ============================================
-    st.subheader(f"⏱️ Duration vs Disk Size - {selected_process}{variant_info}")
+    st.subheader(f"⏱️ Duration vs Disk Size - {selected_process}")
     
     fig_dur = px.scatter(
         df_valid,
@@ -569,7 +528,7 @@ def render_analytics():
     # ============================================
     # PLOT 4: Data Read vs Disk Size
     # ============================================
-    st.subheader(f"📥 Data Read vs Disk Size - {selected_process}{variant_info}")
+    st.subheader(f"📥 Data Read vs Disk Size - {selected_process}")
     
     fig_read = px.scatter(
         df_valid,
@@ -602,7 +561,7 @@ def render_analytics():
     # ============================================
     # PLOT 5: Data Written vs Disk Size
     # ============================================
-    st.subheader(f"📤 Data Written vs Disk Size - {selected_process}{variant_info}")
+    st.subheader(f"📤 Data Written vs Disk Size - {selected_process}")
     
     fig_write = px.scatter(
         df_valid,
@@ -635,7 +594,7 @@ def render_analytics():
     # ============================================
     # PLOT 6: Memory vs I/O (Memory-Heavy Detection)
     # ============================================
-    st.subheader(f"🧠 Memory vs I/O - {selected_process}{variant_info}")
+    st.subheader(f"🧠 Memory vs I/O - {selected_process}")
     st.write("*High memory with low I/O = memory-intensive computation*")
     
     fig_mem_io = px.scatter(
@@ -1159,7 +1118,7 @@ def render_model_performance():
         st.error(f"Connection failed: {e}")
 
 def main():
-    st.title("Nextflow Process Resource Monitoring")
+    st.title("GW-RePO (Genomic Workflow Resource and Parameter Optimization)")
     
     if not API_KEY:
         st.warning("Please enter your API key in the sidebar to authenticate.")
