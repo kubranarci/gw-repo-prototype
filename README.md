@@ -2,6 +2,20 @@
 
 Track Nextflow workflow resource usage and get ML-powered recommendations for local execution.
 
+## Recent Changes
+
+### v0.2.0 (Latest)
+- **Workflow Summaries page**: New default landing page with workflow-level metrics and visualizations
+- **Module name normalization**: Automatic normalization using nf-core cache (e.g., `BCFTOOLS_REHEADER_1` → `BCFTOOLS_REHEADER`)
+- **Improved navigation**: Dropdown-based navigation with Workflow Summaries as default
+- **Per-process ML models**: Each nf-core module gets its own trained model when ≥10 samples available
+
+### Migration
+To normalize existing module names in your database:
+```bash
+python scripts/migrate_normalize_modules.py
+```
+
 ## Quick Start
 
 ```bash
@@ -12,51 +26,76 @@ docker compose up -d
 ## Architecture
 
 ```
-[ Nextflow Pipeline Execution ]
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Nextflow Pipeline Execution                              │
+└─────────────────────────────────────────────────────────────────────────────┘
        │
-       ├─────────────────────────┬─────────────────────────┬
-       ▼                         ▼                         ▼                       
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐   
-│     work     │         │   bco.json   │         │  trace.txt   │ 
-│  directory   │         │  (optional)  │         │  (required)  │ 
-└──────────────┘         └──────────────┘         └──────────────┘   
-       │                         │                         │
-       └─────────────────────────┴────────────┬────────────┘
+       ├───────────────┬───────────────┬───────────────┬──────────────┬
+       ▼               ▼               ▼               ▼              ▼              
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│     work     │ │   bco.json   │ │  trace.txt   │ │nextflow.log  │ │co2footprint_*│
+│  directory   │ │  (optional)  │ │  (required)  │ │  (optional)  │ │  (optional)  │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+       │               │               │               │              │
+       └───────────────┴───────────────┴───────────────┴──────────────┘
+                                              │
                                               ▼
                                  [ ETL Script and API Client ]
                                               │
                                               ▼ (HTTP POST / Bearer Token)
-┌────────────────────────────────────────────────────────────────┐
-│                      Centralized Service                       │
-│                                                                │
-│                     ┌───────────────────┐                      │
-│                     │    GW RePO API    │◄──────┐              │
-│                     └───────┬───┬───────┘       │              │
-│       (Reads/Writes)        │   │               │ (REST API    │
-│       ┌─────────────────────┘   └───────┐       │  Queries)    │
-│       ▼                                 ▼       │              │
-│ ┌────────────┐                  ┌──────────────┐│              │
-│ │ PostgreSQL │                  │ ML Resource  ││              │
-│ │  Database  │                  │    Models    ││              │
-│ └────────────┘                  └──────────────┘│              │
-│                                                 │              │
-│                     ┌───────────────────┐       │              │
-│                     │ Streamlit UI App  ├───────┘              │
-│                     │   (User Facing)   │                      │
-│                     └───────────────────┘                      │
-└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Centralized Service                         │
+│                                                                     │
+│                     ┌───────────────────┐                           │
+│                     │    GW RePO API    │◄──────────────┐           │
+│                     └─────────┬─────────┘               │           │
+│       (Reads/Writes)          │                         │ (REST     │
+│       ┌───────────────────────┘                         │  API)     │
+│       ▼                                                 │           │
+│ ┌────────────┐                  ┌──────────────────┐    │           │
+│ │ PostgreSQL │                  │ ML Resource      │    │           │
+│ │  Database  │                  │    Models        │    │           │
+│ └────────────┘                  └──────────────────┘    │           │
+│       ▲                                                 │           │
+│       │                                                 │           │
+│       │                  ┌───────────────────┐          │           │
+│       └──────────────────│ Streamlit UI App  │◄─────────┘           │
+│                          │ (User Facing)     │                      │
+│                          │ ───────────────── │                      │
+│                          │ 1. Workflow       │                      │
+│                          │    Summaries      │                      │
+│                          │ 2. Dashboard      │                      │
+│                          │ 3. Analytics      │                      │
+│                          │ 4. ML Training    │                      │
+│                          │ 5. Optimizations  │                      │ 
+│                          │ 6. Model          │                      │
+│                          │    Performance    │                      │
+│                          └───────────────────┘                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Data Sources:**
-- **work directory** - Disk usage, I/O bytes (via `--work-dir` scan)
-- **bco.json** - Provenance data, input/output files (optional)
-- **trace.txt** - Process metrics: CPU, memory, duration, I/O (required)
+
+- **work directory** *(optional, `--work-dir`)* — Disk usage, I/O bytes, peak memory from procfs
+- **bco.json** *(optional)* — Provenance data, input/output files, parameters
+- **trace.txt** *(required)* — Process metrics: CPU%, memory%, duration, I/O
+- **nextflow.log** *(optional)* — Workflow-level: run_name, session_id, wall_clock, status
+- **co2footprint_*.txt** *(optional)* — Energy (mWh), CO2e (mg), car km equivalent, tree sequestration time
 
 **Components:**
-- **GW RePO API** - FastAPI backend (port 80)
-- **PostgreSQL Database** - Workflow execution data (port 5432)
-- **ML Resource Models** - Gradient Boosting predictors
-- **Streamlit UI App** - Analytics dashboard (port 8501)
+
+- **GW RePO API** *(port 80)* — FastAPI backend with REST endpoints
+- **PostgreSQL Database** *(port 5432)* — Persistent storage for workflows, processes, ML models
+- **ML Resource Models** — Per-process Gradient Boosting predictors (memory, time, CPU)
+- **Streamlit UI App** *(port 8501)* — 6-page analytics dashboard
+
+**Why New Input Channels:**
+
+1. **nextflow.log** → Enables **Workflow Summaries** page  
+   Aggregates metrics at workflow level (wall clock, concurrent processes, status) for executive overview before drilling into process details.
+
+2. **co2footprint_*.txt** → Sustainability tracking  
+   Energy consumption and CO2 emissions per workflow for environmental impact analysis and green computing optimization.
 
 **Runs entirely on your machine:**
 - ✅ Private: All data stays local
@@ -115,6 +154,24 @@ python client/client.py <pipeline_info_dir> --work-dir <work_dir>
 
 **Privacy:** File paths are stored for provenance only. ML models use numerical metrics only.
 
+### Module Name Normalization
+
+Process names are automatically normalized using nf-core module cache:
+
+**Examples:**
+- `BCFTOOLS_REHEADER_1`, `BCFTOOLS_REHEADER_2` → `BCFTOOLS_REHEADER`
+- `BCFTOOLS_REHEADER_TP_BASE` → `BCFTOOLS_REHEADER`
+- `TABIX_TABIX_2` → `TABIX_TABIX`
+- `BCFTOOLS_FILTER_QUERY_FP` → `BCFTOOLS_FILTER`
+
+**Benefits:**
+- ✅ Consistent naming across all views
+- ✅ Aggregates metrics from multiple runs with different suffixes
+- ✅ ML models trained on consolidated data per module
+- ✅ Cleaner optimization recommendations
+
+**Migration:** Run `python scripts/migrate_normalize_modules.py` to normalize existing data.
+
 ## View Dashboard
 
 ```bash
@@ -125,7 +182,21 @@ Open http://localhost:8501
 
 ### Dashboard Pages
 
-#### 1. Dashboard
+#### 1. Workflow Summaries (Default)
+
+Overview of workflow-level execution metrics and visualizations
+
+- Total workflow runs count
+- Workflow execution table with key metrics
+- Visualizations:
+  - Workflow status distribution (pie chart)
+  - Wall clock time distribution (histogram)
+  - Memory vs CPU usage (scatter plot)
+  - Concurrent processes distribution (histogram)
+
+---
+
+#### 2. Dashboard
 
 Enables quick overview of all workflow executions and, find resource-heavy processes
 
@@ -137,7 +208,7 @@ Enables quick overview of all workflow executions and, find resource-heavy proce
 
 ---
 
-#### 2. Analytics
+#### 3. Analytics
 
 Helps to understand resource patterns per process and identification of bottlenecks
 
@@ -158,7 +229,7 @@ Helps to understand resource patterns per process and identification of bottlene
 
 ---
 
-#### 3. ML Training
+#### 4. ML Training
 
 Train resource prediction models here
 
@@ -175,7 +246,7 @@ Train resource prediction models here
 
 ---
 
-#### 4. ML Predictions
+#### 5. ML Predictions
 Get resource recommendations for a specific process before running your new analysis
 - Enter process name (e.g., `BCFTOOLS_FILTER`)
 - Get predictions for SMALL, MEDIUM, LARGE dataset scenarios
@@ -189,7 +260,7 @@ Get resource recommendations for a specific process before running your new anal
 
 ---
 
-#### 5. Optimization
+#### 6. Optimization
 Get data-driven recommendations for all processes
 
 **Features:**
@@ -205,7 +276,7 @@ Get data-driven recommendations for all processes
 
 ---
 
-#### 6. Model Performance
+#### 7. Model Performance
 Monitor trained model quality before trusting predictions
 
 - List all trained models (memory, time, CPU per process)
