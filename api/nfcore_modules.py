@@ -41,7 +41,7 @@ def _load_cache():
         pass
 
 
-def normalize_module_name(process_name: str) -> str:
+def normalize_module_name(process_name: str, nfcore_cache=None) -> str:
     """
     Normalize process name to nf-core TOOL_SUBTOOL format.
     
@@ -105,3 +105,8 @@ def normalize_module_name(process_name: str) -> str:
 def get_module_display_name(module_name: str) -> str:
     """Get human-readable display name."""
     return module_name.replace('_', ' ')
+
+def get_nfcore_modules():
+    """Return the loaded nf-core modules set."""
+    _load_cache()
+    return list(NFCORE_MODULES)

@@ -19,9 +19,10 @@ with st.sidebar:
     st.divider()
     
     st.subheader("Navigation")
-    page = st.radio(
-        "Go to",
-        ["Dashboard", "Analytics", "ML Training", "Optimizations", "Model Performance"],
+    page = st.selectbox(
+        "Select page",
+        ["Workflow Summaries", "Dashboard", "Analytics", "ML Training", "Optimizations", "Model Performance"],
+        index=0,
         label_visibility="collapsed"
     )
 
@@ -1117,6 +1118,73 @@ def render_model_performance():
     except Exception as e:
         st.error(f"Connection failed: {e}")
 
+
+def render_workflow_summaries():
+    """Workflow Summaries page showing workflow-level metrics."""
+    st.title("📊 Workflow Summaries")
+    st.write("**Workflow-level execution metrics and visualizations**")
+    
+    if not API_KEY:
+        st.warning("Please enter your API key in the sidebar to authenticate.")
+        return
+    
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    
+    try:
+        response = requests.get(f"{API_BASE_URL}/workflows/", headers=headers)
+        
+        if response.status_code == 200:
+            workflows = response.json()
+            
+            if not workflows:
+                st.info("No workflow data available. Submit workflow runs first.")
+                return
+            
+            st.metric("Total Workflow Runs", len(workflows))
+            
+            df = pd.DataFrame(workflows)
+            
+            if not df.empty:
+                st.subheader("📋 Workflow Execution Table")
+                display_cols = [col for col in ['id', 'run_name', 'final_state', 'wall_clock_sec', 'peak_cpu_percent', 'peak_memory_mb', 'max_concurrent_processes'] if col in df.columns]
+                if display_cols:
+                    st.dataframe(df[display_cols], use_container_width=True)
+                
+                st.divider()
+                st.subheader("📊 Workflow Metrics Visualizations")
+                
+                if 'final_state' in df.columns:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        status_counts = df['final_state'].value_counts()
+                        fig = px.pie(values=status_counts.values, names=status_counts.index, title='Workflow Status Distribution')
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with col2:
+                        if 'wall_clock_sec' in df.columns:
+                            df_clean = df[df['wall_clock_sec'].notna()]
+                            if not df_clean.empty:
+                                fig = px.histogram(df_clean, x='wall_clock_sec', title='Wall Clock Time Distribution', nbins=20)
+                                fig.update_layout(xaxis_title='Duration (seconds)')
+                                st.plotly_chart(fig, use_container_width=True)
+                
+                if 'peak_memory_mb' in df.columns and 'peak_cpu_percent' in df.columns:
+                    df_clean = df[(df['peak_memory_mb'].notna()) & (df['peak_cpu_percent'].notna())]
+                    if not df_clean.empty:
+                        fig = px.scatter(df_clean, x='peak_memory_mb', y='peak_cpu_percent', title='Memory vs CPU Usage',
+                                        hover_data=['run_name'] if 'run_name' in df_clean.columns else None)
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                if 'max_concurrent_processes' in df.columns:
+                    df_clean = df[df['max_concurrent_processes'].notna()]
+                    if not df_clean.empty:
+                        fig = px.histogram(df_clean, x='max_concurrent_processes', title='Concurrent Processes Distribution', nbins=20)
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+    except Exception as e:
+        st.error(f"Failed to fetch workflow data: {e}")
+
+
 def main():
     st.title("GW-RePO (Genomic Workflow Resource and Parameter Optimization)")
     
@@ -1124,7 +1192,9 @@ def main():
         st.warning("Please enter your API key in the sidebar to authenticate.")
         return
     
-    if page == "Dashboard":
+    if page == "Workflow Summaries":
+        render_workflow_summaries()
+    elif page == "Dashboard":
         df = fetch_process_data(API_KEY)
         render_resource_charts(df)
     elif page == "Analytics":
